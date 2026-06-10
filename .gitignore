@@ -47,3 +47,6 @@ best_model*.pth
 
 # Logs
 *.log
+
+#zip
+*.zip

@@ -50,7 +50,7 @@ DEFAULT_CONFIG = {
     "min_score_display": 0.05,
     # 视觉显著性参数
     "salience_a_weight": 1.3,          # 色度计算中 a* 的加权: chroma=sqrt(a_weight*a²+b²)
-    "salience_chroma_logit": 2.0,      # 色度/亮度权重比值 logit, sigmoid后 w_chroma=w_L=0.5
+    "salience_chroma_logit": 1.0,      # 色度/亮度权重比值 logit, sigmoid后 w_chroma=w_L=0.5
 }
 
 

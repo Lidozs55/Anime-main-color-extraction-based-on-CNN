@@ -188,18 +188,20 @@ def show_preview_and_wait(canvas, img_info, region_type):
 
 
 def get_user_permutation(n_colors):
-    """读取用户输入的排列，空白回车默认为 2 1 3"""
+    """读取用户输入的排列，空白回车默认为 2 1 3；输入 0 跳过此图"""
     while True:
         try:
             if n_colors == 3:
-                prompt = "请输入色彩排序（空格分隔三个数字，如 2 1 3；直接回车默认 2 1 3）："
+                prompt = "请输入色彩排序（空格分隔三个数字，如 2 1 3；直接回车默认 2 1 3；输入 0 跳过此图）："
             else:
                 expected = " ".join(str(i) for i in range(1, n_colors + 1))
-                prompt = f"请输入色彩排序（空格分隔{n_colors}个数字，如 {expected}；直接回车保持当前顺序）："
+                prompt = f"请输入色彩排序（空格分隔{n_colors}个数字，如 {expected}；直接回车保持当前顺序；输入 0 跳过此图）："
 
             user_input = input(prompt).strip()
             if user_input == "":
-                return [2, 1, 3] if n_colors == 3 else list(range(1, n_colors + 1))
+                return [2, 1, 3] if n_colors == 3 else list(range(1, n_colors + 1)), False
+            if user_input == "0":
+                return None, True
             parts = list(map(int, user_input.split()))
             if len(parts) != n_colors:
                 print(f"错误：请输入恰好 {n_colors} 个数字")
@@ -208,7 +210,7 @@ def get_user_permutation(n_colors):
                 expected = " ".join(str(i) for i in range(1, n_colors + 1))
                 print(f"错误：输入必须是 {expected} 的排列")
                 continue
-            return parts
+            return parts, False
         except ValueError:
             print("错误：请输入有效的整数")
 
@@ -216,7 +218,7 @@ def get_user_permutation(n_colors):
 # ─── 颜色处理（与 generate_targets.py 逻辑一致） ──────────────────────────
 
 def process_colors(colors, img_info, region_type):
-    """处理前景或背景颜色，返回软目标 Lab 值"""
+    """处理前景或背景颜色，返回软目标 Lab 值或 None（跳过）"""
     n_colors = min(len(colors), 3)
     if n_colors == 0:
         return 50.0, 0.0, 0.0
@@ -248,7 +250,10 @@ def process_colors(colors, img_info, region_type):
 
             show_preview_and_wait(canvas, img_info, region_type)
 
-            perm = get_user_permutation(n_colors)
+            perm, skip = get_user_permutation(n_colors)
+            if skip:
+                print(f"  用户选择跳过此图")
+                return None, None, None
             print(f"  用户输入排序: {perm}")
 
             new_order = [sorted_colors[p - 1] for p in perm]
@@ -333,9 +338,15 @@ def process_one_batch(batch_targets):
 
         fg_colors = result["foreground"]["main_colors"]
         L_fg, a_fg, b_fg = process_colors(fg_colors, info, "fg")
+        if L_fg is None:
+            print(f"  跳过 {img_filename}")
+            continue
 
         bg_colors = result["background"]["main_colors"]
         L_bg, a_bg, b_bg = process_colors(bg_colors, info, "bg")
+        if L_bg is None:
+            print(f"  跳过 {img_filename}（背景阶段）")
+            continue
 
         batch_targets[src_url] = {
             "L_fg": round(L_fg, 1), "a_fg": round(a_fg, 1), "b_fg": round(b_fg, 1),

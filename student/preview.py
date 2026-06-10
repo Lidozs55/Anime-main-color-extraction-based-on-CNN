@@ -85,7 +85,11 @@ def main():
 
     # 加载模型
     model = ColorNetMasked().to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    ckpt = torch.load(model_path, map_location=device)
+    if 'model' in ckpt:
+        model.load_state_dict(ckpt['model'])
+    else:
+        model.load_state_dict(ckpt)
     model.eval()
 
     # 收集图片
