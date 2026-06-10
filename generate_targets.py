@@ -119,7 +119,7 @@ def show_preview_and_wait(canvas, img_filename, region_type):
 
 
 def get_user_permutation(n_colors):
-    """读取用户输入的排列，空白回车默认为 2 1 3（仅适用于3色情况）
+    """读取用户输入的排列，空白回车默认为 1 2 3（仅适用于3色情况）
     输入 0 表示跳过此图（不标注）
     返回 (perm, skip_flag) 或 None (skip=True)"""
     while True:
@@ -133,7 +133,7 @@ def get_user_permutation(n_colors):
             user_input = input(prompt).strip()
             if user_input == "":
                 if n_colors == 3:
-                    return [2, 1, 3], False
+                    return [1, 2, 3], False
                 else:
                     return list(range(1, n_colors + 1)), False
             if user_input == "0":
