@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Generated outputs
+outputs/
+model_previews/
+extracted_imgs/
+
+# Generated JSON data
+results.json
+targets.json
+
+# ML model checkpoints
+*.pth
+*.pt
+*.onnx
+checkpoint*.pth
+best_model*.pth
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
