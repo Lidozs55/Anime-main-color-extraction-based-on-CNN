@@ -27,7 +27,7 @@ DEFAULT_CONFIG = {
     # 预处理
     "max_size": 512,
     # 分割（3个核心参数，控制主体识别的激进程度）
-    "chroma_threshold": 10.0,       # 色度阈值：越低→识别越激进，更多彩色区域被纳入主体
+    "chroma_threshold": 12.0,       # 色度阈值：越低→识别越激进，更多彩色区域被纳入主体
     "min_contour_area_ratio": 0.02,  # 最小轮廓面积比：越低→保留更小的轮廓细节
     "foreground_score_threshold": 0.5, # 前景得分阈值：越低→主体识别越激进
     # 空洞检测（GrabCut 精修用，控制环状主体内部空洞的识别）

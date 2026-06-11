@@ -1,4 +1,4 @@
-import os, json, re
+import os, json, re, random
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
@@ -52,22 +52,27 @@ class ColorDataset(Dataset):
 
         self.paths = sorted(self.targets.keys())
         n = len(self.paths)
-        split_idx = max(1, int(n * 0.8))
-        if split == 'train':
-            self.paths = self.paths[:split_idx]
-        else:
-            self.paths = self.paths[split_idx:]
+        # 随机划分 train/val（固定种子保证可复现）
+        if split != 'all':
+            rng = random.Random(42)
+            shuffled = self.paths[:]
+            rng.shuffle(shuffled)
+            split_idx = max(1, int(n * 0.6))
+            if split == 'train':
+                self.paths = sorted(shuffled[:split_idx])
+            else:
+                self.paths = sorted(shuffled[split_idx:])
 
-        if split == 'train':
+        if split == 'val':
             self.transform = T.Compose([
-                T.RandomHorizontalFlip(0.5),
-                T.RandomRotation(15, fill=0),
-                T.RandomResizedCrop(img_size, scale=(0.8, 1.0), ratio=(0.9, 1.1)),
+                T.Resize((img_size, img_size)),
                 T.ToTensor(),
             ])
         else:
             self.transform = T.Compose([
-                T.Resize((img_size, img_size)),
+                T.RandomResizedCrop(img_size, scale=(0.8, 1.0), ratio=(0.9, 1.1)),
+                T.RandomHorizontalFlip(0.5),
+                T.RandomRotation(15, fill=(128, 128, 128)),
                 T.ToTensor(),
             ])
 
@@ -142,4 +147,9 @@ class ColorDataset(Dataset):
         img = Image.open(path).convert('RGB')
         img_t = self.transform(img)
         tgt = self.targets[path]
-        return img_t, torch.tensor([tgt['L_fg'], tgt['a_fg'], tgt['b_fg']]), torch.tensor([tgt['L_bg'], tgt['a_bg'], tgt['b_bg']])
+        fg_conf = tgt.get('fg_conf', 1.0)
+        bg_conf = tgt.get('bg_conf', 1.0)
+        return (img_t,
+                torch.tensor([tgt['L_fg'], tgt['a_fg'], tgt['b_fg']]),
+                torch.tensor([tgt['L_bg'], tgt['a_bg'], tgt['b_bg']]),
+                torch.tensor([fg_conf, bg_conf]))

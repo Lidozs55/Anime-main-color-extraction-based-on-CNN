@@ -34,7 +34,7 @@ class ColorNetMasked(nn.Module):
             nn.BatchNorm2d(16),
             nn.ReLU6(inplace=True)
         )
-        self.block1 = MBConv(16, 16, 1, 1)
+        self.block1 = MBConv(16, 16, 1, 2)
         self.block2 = MBConv(16, 24, 2, 4)
         self.block3 = MBConv(24, 24, 1, 4)
         self.block4 = MBConv(24, 32, 2, 6)
@@ -48,8 +48,8 @@ class ColorNetMasked(nn.Module):
             nn.Conv2d(64, 1, 1),
             nn.Sigmoid()
         )
-        self.fg_fc = nn.Sequential(nn.Linear(64, 32), nn.ReLU(), nn.Linear(32, 3))
-        self.bg_fc = nn.Sequential(nn.Linear(64, 32), nn.ReLU(), nn.Linear(32, 3))
+        self.fg_fc = nn.Sequential(nn.Linear(64, 32), nn.ReLU(), nn.Dropout(0.2), nn.Linear(32, 3))
+        self.bg_fc = nn.Sequential(nn.Linear(64, 32), nn.ReLU(), nn.Dropout(0.2), nn.Linear(32, 3))
         self._init_weights()
 
     def _init_weights(self):

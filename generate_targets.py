@@ -3,7 +3,7 @@
 生成蒸馏软目标 targets.json
 
 读取 outputs/results.json，对每张图片的前景/背景主色进行交互校正，
-应用 softmax 加权后生成 targets.json。
+直接选取人类认可的颜色作为 target（不做加权平均）。
 
 支持断点续传：Ctrl+C 中断后，重新运行会从上次中断处继续。
 """
@@ -12,21 +12,11 @@ import math
 import os
 import sys
 import tempfile
-import signal
 
 from PIL import Image, ImageDraw
 
 
 BREAKPOINT_FILE = 'targets_progress.json'
-
-
-def softmax(scores, temperature=2.0):
-    """计算 softmax 权重"""
-    scaled = [s / temperature for s in scores]
-    max_s = max(scaled)
-    exps = [math.exp(s - max_s) for s in scaled]
-    total = sum(exps)
-    return [e / total for e in exps]
 
 
 def lab_to_rgb(L, a, b):
@@ -118,35 +108,16 @@ def show_preview_and_wait(canvas, img_filename, region_type):
     print(f"  [正在处理{region_label}] 预览图已弹窗显示，请查看...")
 
 
-def get_user_permutation(n_colors):
-    """读取用户输入的排列，空白回车默认为 1 2 3（仅适用于3色情况）
-    输入 0 表示跳过此图（不标注）
-    返回 (perm, skip_flag) 或 None (skip=True)"""
+def select_color_index(n_colors):
+    """读取用户选择：0=跳过，1~N=选对应名次"""
+    options = "/".join(str(i) for i in range(n_colors + 1))
     while True:
         try:
-            if n_colors == 3:
-                prompt = "请输入色彩排序（空格分隔三个数字，如 2 1 3；直接回车默认 2 1 3；输入 0 跳过此图）："
-            else:
-                expected = ' '.join(str(i) for i in range(1, n_colors + 1))
-                prompt = f"请输入色彩排序（空格分隔{n_colors}个数字，如 {expected}；直接回车保持当前顺序；输入 0 跳过此图）："
-            
-            user_input = input(prompt).strip()
-            if user_input == "":
-                if n_colors == 3:
-                    return [1, 2, 3], False
-                else:
-                    return list(range(1, n_colors + 1)), False
-            if user_input == "0":
-                return None, True
-            parts = list(map(int, user_input.split()))
-            if len(parts) != n_colors:
-                print(f"错误：请输入恰好 {n_colors} 个数字")
+            user_input = input(f"请选择主色编号（{options}，0=跳过）：").strip()
+            if user_input not in [str(i) for i in range(n_colors + 1)]:
+                print(f"错误：请输入 0~{n_colors}")
                 continue
-            if sorted(parts) != list(range(1, n_colors + 1)):
-                expected = ' '.join(str(i) for i in range(1, n_colors + 1))
-                print(f"错误：输入必须是 {expected} 的排列")
-                continue
-            return parts, False
+            return int(user_input)
         except ValueError:
             print("错误：请输入有效的整数")
 
@@ -174,79 +145,81 @@ def process_colors(colors, img_filename, region_type, img_dir):
     """
     处理前景或背景颜色
     colors: list of dict with 'lab' and 'score'
-    返回软目标 Lab 值，或 None（用户选择跳过此图）
+    返回 (L, a, b, confidence) 或 (None, None, None, None)（用户选择跳过此图）
+    confidence = score1 / (score1 + score2)，衡量 teacher 对 top 候选的区分度
     """
-    n_colors = min(len(colors), 3)
+    n_colors = min(len(colors), 5)
     if n_colors == 0:
-        return 50.0, 0.0, 0.0  # 默认中性值
-    
+        return 50.0, 0.0, 0.0, 1.0  # 默认中性值，置信度 1.0
+
     sorted_colors = sorted(colors, key=lambda c: c['score'], reverse=True)[:n_colors]
-    
-    print(f"\n  处理 {img_filename} - {region_type}")
-    
+
+    # 计算 teacher 置信度
+    if n_colors >= 2:
+        s1, s2 = sorted_colors[0]['score'], sorted_colors[1]['score']
+        confidence = s1 / (s1 + s2) if (s1 + s2) > 0 else 1.0
+    else:
+        confidence = 1.0
+
+    print(f"\n  处理 {img_filename} - {region_type} (conf={confidence:.3f})")
+
+    # 打印候选颜色
+    for i in range(n_colors):
+        c = sorted_colors[i]
+        label = f"  第{i+1}名: Lab={c['lab']} (score={c['score']:.4f})"
+        print(label)
+
     if n_colors >= 2:
         score1 = sorted_colors[0]['score']
         score2 = sorted_colors[1]['score']
-        gap = (score1 - score2) / score1 if score1 > 0 else 0
-        
-        # 打印当前排序
-        for i in range(n_colors):
-            c = sorted_colors[i]
-            label = f"  当前排序: {i+1}" if i == 0 else f"             {i+1}"
-            print(f"{label}: Lab={c['lab']} (score={c['score']:.4f})")
-        print(f"  gap = {gap:.4f}")
-        
-        if gap < 0.05:
+        gap12 = (score1 - score2) / score1 if score1 > 0 else 0
+
+        # 检查 score1 与 score3 的差距
+        gap13 = 0
+        if n_colors >= 3:
+            score3 = sorted_colors[2]['score']
+            gap13 = (score1 - score3) / score1 if score1 > 0 else 0
+
+        print(f"  gap12 = {gap12:.4f}  gap13 = {gap13:.4f}")
+
+        need_human = gap12 < 0.05 or (n_colors >= 3 and gap13 < 0.20)
+        if need_human:
+            reason = "gap12<0.05" if gap12 < 0.05 else "gap13<0.20"
+            # 需要人工选择
             preview_colors = []
             for c in sorted_colors:
                 lab = c['lab']
                 preview_colors.append((lab[0], lab[1], lab[2], c['score']))
-            
+
             img_path = os.path.join(img_dir, img_filename)
             if not os.path.exists(img_path):
-                print(f"  警告：找不到图片 {img_path}，跳过人工干预")
+                print(f"  警告：找不到图片 {img_path}，默认选择第1名")
+                selected_lab = sorted_colors[0]['lab']
+                return selected_lab[0], selected_lab[1], selected_lab[2], confidence
             else:
                 canvas = create_preview(img_path, preview_colors)
-                
-                print(f"  gap < 0.05，需要人工确认排序")
+
+                print(f"  {reason}，需要人工确认主色")
                 label_str = '  '.join([f"{i+1}: Lab={sorted_colors[i]['lab']}" for i in range(n_colors)])
-                print(f"  当前排序：{label_str}")
-                
+                print(f"  候选颜色：{label_str}")
+
                 show_preview_and_wait(canvas, img_filename, region_type)
-                
-                perm, skip = get_user_permutation(n_colors)
-                if skip:
+
+                choice = select_color_index(n_colors)
+                if choice == 0:
                     print(f"  用户选择跳过此图")
-                    return None, None, None
-                print(f"  用户输入排序: {perm}")
-                
-                new_order = []
-                for p in perm:
-                    new_order.append(sorted_colors[p - 1])
-                
-                # 保存原分数
-                original_scores = [c['score'] for c in sorted_colors]
-                sorted_colors = new_order
-                
-                for i in range(n_colors):
-                    sorted_colors[i]['score'] = original_scores[i]
+                    return None, None, None, None
+
+                selected_lab = sorted_colors[choice - 1]['lab']
+                print(f"  用户选择第{choice}名: Lab={selected_lab}")
+                return selected_lab[0], selected_lab[1], selected_lab[2], confidence
     else:
-        print(f"  仅 {n_colors} 个颜色，跳过 gap 检测")
-    
-    # 第一名分数乘以2
-    sorted_colors[0]['score'] *= 2.0
-    
-    scores = [c['score'] for c in sorted_colors]
-    weights = softmax(scores, temperature=2.0)
-    
-    L_sum = sum(w * c['lab'][0] for w, c in zip(weights, sorted_colors))
-    a_sum = sum(w * c['lab'][1] for w, c in zip(weights, sorted_colors))
-    b_sum = sum(w * c['lab'][2] for w, c in zip(weights, sorted_colors))
-    
-    print(f"  最终权重: {[f'{w:.4f}' for w in weights]}")
-    print(f"  软目标 Lab: L={L_sum:.1f} a={a_sum:.1f} b={b_sum:.1f}")
-    
-    return L_sum, a_sum, b_sum
+        print(f"  仅 {n_colors} 个颜色，自动选择第1名")
+
+    # gap12 >= 0.05 且 gap13 >= 0.20 或仅1个颜色，自动选择第1名
+    selected_lab = sorted_colors[0]['lab']
+    print(f"  自动选择第1名: Lab={selected_lab}")
+    return selected_lab[0], selected_lab[1], selected_lab[2], confidence
 
 
 def main():
@@ -270,28 +243,35 @@ def main():
         
         # 跳过已处理的图片
         skip = True
+        start_idx = 0
         for i, result in enumerate(results):
             img_filename = os.path.basename(result['image'])
             if skip and img_filename == last_img:
+                start_idx = i
                 if last_region == 'fg':
                     print(f"\n>>> 从断点恢复：跳过 {img_filename} 的前景，从其背景开始")
                     # 重新处理该图片的背景
                     bg_colors = result['background']['main_colors']
-                    L_bg, a_bg, b_bg = process_colors(bg_colors, img_filename, 'bg', img_dir)
-                    targets[img_filename] = {
-                        'L_fg': round(targets[img_filename].get('L_fg', 50.0), 1),
-                        'a_fg': round(targets[img_filename].get('a_fg', 0.0), 1),
-                        'b_fg': round(targets[img_filename].get('b_fg', 0.0), 1),
-                        'L_bg': round(L_bg, 1),
-                        'a_bg': round(a_bg, 1),
-                        'b_bg': round(b_bg, 1),
-                    }
-                    save_checkpoint(targets, img_filename, 'bg')
+                    L_bg, a_bg, b_bg, bg_conf = process_colors(bg_colors, img_filename, 'bg', img_dir)
+                    if L_bg is not None:
+                        targets[img_filename] = {
+                            'L_fg': round(targets[img_filename].get('L_fg', 50.0), 1),
+                            'a_fg': round(targets[img_filename].get('a_fg', 0.0), 1),
+                            'b_fg': round(targets[img_filename].get('b_fg', 0.0), 1),
+                            'fg_conf': targets[img_filename].get('fg_conf', 1.0),
+                            'L_bg': round(L_bg, 1),
+                            'a_bg': round(a_bg, 1),
+                            'b_bg': round(b_bg, 1),
+                            'bg_conf': round(bg_conf, 4),
+                        }
+                        save_checkpoint(targets, img_filename, 'bg')
+                    else:
+                        if img_filename in targets:
+                            del targets[img_filename]
+                        save_checkpoint(targets, '', 'skip')
                 skip = False
                 continue
-            if skip:
-                continue
-        results = results[i:] if not skip else []
+        results = results[start_idx:] if not skip else []
         if not results and skip:
             # 全部处理完了
             with open(targets_path, 'w', encoding='utf-8') as f:
@@ -308,19 +288,20 @@ def main():
         img_filename = os.path.basename(img_path)
         
         fg_colors = result['foreground']['main_colors']
-        L_fg, a_fg, b_fg = process_colors(fg_colors, img_filename, 'fg', img_dir)
+        L_fg, a_fg, b_fg, fg_conf = process_colors(fg_colors, img_filename, 'fg', img_dir)
         if L_fg is None:
             print(f"  跳过 {img_filename}")
             continue
-        
+
         targets.setdefault(img_filename, {})
         targets[img_filename]['L_fg'] = round(L_fg, 1)
         targets[img_filename]['a_fg'] = round(a_fg, 1)
         targets[img_filename]['b_fg'] = round(b_fg, 1)
+        targets[img_filename]['fg_conf'] = round(fg_conf, 4)
         save_checkpoint(targets, img_filename, 'fg')
-        
+
         bg_colors = result['background']['main_colors']
-        L_bg, a_bg, b_bg = process_colors(bg_colors, img_filename, 'bg', img_dir)
+        L_bg, a_bg, b_bg, bg_conf = process_colors(bg_colors, img_filename, 'bg', img_dir)
         if L_bg is None:
             print(f"  跳过 {img_filename}（背景阶段）")
             # 移除之前添加的前景数据
@@ -328,10 +309,11 @@ def main():
                 del targets[img_filename]
             save_checkpoint(targets, img_filename, 'bg')
             continue
-        
+
         targets[img_filename]['L_bg'] = round(L_bg, 1)
         targets[img_filename]['a_bg'] = round(a_bg, 1)
         targets[img_filename]['b_bg'] = round(b_bg, 1)
+        targets[img_filename]['bg_conf'] = round(bg_conf, 4)
         save_checkpoint(targets, img_filename, 'bg')
     
     with open(targets_path, 'w', encoding='utf-8') as f:

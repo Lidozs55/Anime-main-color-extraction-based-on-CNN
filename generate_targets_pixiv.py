@@ -27,8 +27,7 @@ from PIL import Image, ImageDraw
 
 # ─── 配置 ───────────────────────────────────────────────────────────────
 PIXIV_API = "https://api.lolicon.app/setu/v2"
-BATCH_SIZE = 20          # 每次下载图片数
-PROCESS_COUNT = 10       # 实际处理图片数
+BATCH_SIZE = 20          # 每次下载图片数（全部处理）
 TEMP_DIR = "pixiv_temp"
 BREAKPOINT_FILE = "targets_pixiv_progress.json"
 
@@ -187,95 +186,86 @@ def show_preview_and_wait(canvas, img_info, region_type):
     print(f"  [{img_info['local_name']} - {region_label}] 预览图已弹窗显示，请查看...")
 
 
-def get_user_permutation(n_colors):
-    """读取用户输入的排列，空白回车默认为 2 1 3；输入 0 跳过此图"""
+def select_color_index(n_colors):
+    """读取用户选择：0=跳过，1~N=选对应名次"""
+    options = "/".join(str(i) for i in range(n_colors + 1))
     while True:
         try:
-            if n_colors == 3:
-                prompt = "请输入色彩排序（空格分隔三个数字，如 2 1 3；直接回车默认 2 1 3；输入 0 跳过此图）："
-            else:
-                expected = " ".join(str(i) for i in range(1, n_colors + 1))
-                prompt = f"请输入色彩排序（空格分隔{n_colors}个数字，如 {expected}；直接回车保持当前顺序；输入 0 跳过此图）："
-
-            user_input = input(prompt).strip()
-            if user_input == "":
-                return [2, 1, 3] if n_colors == 3 else list(range(1, n_colors + 1)), False
-            if user_input == "0":
-                return None, True
-            parts = list(map(int, user_input.split()))
-            if len(parts) != n_colors:
-                print(f"错误：请输入恰好 {n_colors} 个数字")
+            user_input = input(f"请选择主色编号（{options}，0=跳过）：").strip()
+            if user_input not in [str(i) for i in range(n_colors + 1)]:
+                print(f"错误：请输入 0~{n_colors}")
                 continue
-            if sorted(parts) != list(range(1, n_colors + 1)):
-                expected = " ".join(str(i) for i in range(1, n_colors + 1))
-                print(f"错误：输入必须是 {expected} 的排列")
-                continue
-            return parts, False
+            return int(user_input)
         except ValueError:
             print("错误：请输入有效的整数")
 
 
-# ─── 颜色处理（与 generate_targets.py 逻辑一致） ──────────────────────────
-
 def process_colors(colors, img_info, region_type):
-    """处理前景或背景颜色，返回软目标 Lab 值或 None（跳过）"""
-    n_colors = min(len(colors), 3)
+    """处理前景或背景颜色，返回 (L, a, b, confidence) 或 (None, None, None, None)"""
+    n_colors = min(len(colors), 5)
     if n_colors == 0:
-        return 50.0, 0.0, 0.0
+        return 50.0, 0.0, 0.0, 1.0
 
     sorted_colors = sorted(colors, key=lambda c: c["score"], reverse=True)[:n_colors]
+
+    # 计算 teacher 置信度
+    if n_colors >= 2:
+        s1, s2 = sorted_colors[0]["score"], sorted_colors[1]["score"]
+        confidence = s1 / (s1 + s2) if (s1 + s2) > 0 else 1.0
+    else:
+        confidence = 1.0
+
     local_name = img_info["local_name"]
     img_path = img_info["local_path"]
 
-    print(f"\n  处理 {local_name} - {region_type}")
+    print(f"\n  处理 {local_name} - {region_type} (conf={confidence:.3f})")
+
+    # 打印候选颜色
+    for i in range(n_colors):
+        c = sorted_colors[i]
+        label = f"  第{i+1}名: Lab={c['lab']} (score={c['score']:.4f})"
+        print(label)
 
     if n_colors >= 2:
         score1 = sorted_colors[0]["score"]
         score2 = sorted_colors[1]["score"]
-        gap = (score1 - score2) / score1 if score1 > 0 else 0
+        gap12 = (score1 - score2) / score1 if score1 > 0 else 0
 
-        for i in range(n_colors):
-            c = sorted_colors[i]
-            label = f"  当前排序: {i+1}" if i == 0 else f"             {i+1}"
-            print(f"{label}: Lab={c['lab']} (score={c['score']:.4f})")
-        print(f"  gap = {gap:.4f}")
+        # 检查 score1 与 score3 的差距
+        gap13 = 0
+        if n_colors >= 3:
+            score3 = sorted_colors[2]["score"]
+            gap13 = (score1 - score3) / score1 if score1 > 0 else 0
 
-        if gap < 0.05:
+        print(f"  gap12 = {gap12:.4f}  gap13 = {gap13:.4f}")
+
+        need_human = gap12 < 0.05 or (n_colors >= 3 and gap13 < 0.20)
+        if need_human:
+            reason = "gap12<0.05" if gap12 < 0.05 else "gap13<0.20"
             preview_colors = [(c["lab"][0], c["lab"][1], c["lab"][2], c["score"]) for c in sorted_colors]
             canvas = create_preview(img_path, preview_colors)
 
-            print(f"  gap < 0.05，需要人工确认排序")
+            print(f"  {reason}，需要人工确认主色")
             label_str = "  ".join([f"{i+1}: Lab={sorted_colors[i]['lab']}" for i in range(n_colors)])
-            print(f"  当前排序：{label_str}")
+            print(f"  候选颜色：{label_str}")
 
             show_preview_and_wait(canvas, img_info, region_type)
 
-            perm, skip = get_user_permutation(n_colors)
-            if skip:
+            choice = select_color_index(n_colors)
+            if choice == 0:
                 print(f"  用户选择跳过此图")
-                return None, None, None
-            print(f"  用户输入排序: {perm}")
+                return None, None, None, None
 
-            new_order = [sorted_colors[p - 1] for p in perm]
-            original_scores = [c["score"] for c in sorted_colors]
-            sorted_colors = new_order
-            for i in range(n_colors):
-                sorted_colors[i]["score"] = original_scores[i]
+            selected_lab = sorted_colors[choice - 1]["lab"]
+            print(f"  用户选择第{choice}名: Lab={selected_lab}")
+            return selected_lab[0], selected_lab[1], selected_lab[2], confidence
     else:
-        print(f"  仅 {n_colors} 个颜色，跳过 gap 检测")
+        print(f"  仅 {n_colors} 个颜色，自动选择第1名")
 
-    sorted_colors[0]["score"] *= 2.0
-    scores = [c["score"] for c in sorted_colors]
-    weights = softmax(scores, temperature=2.0)
-
-    L_sum = sum(w * c["lab"][0] for w, c in zip(weights, sorted_colors))
-    a_sum = sum(w * c["lab"][1] for w, c in zip(weights, sorted_colors))
-    b_sum = sum(w * c["lab"][2] for w, c in zip(weights, sorted_colors))
-
-    print(f"  最终权重: {[f'{w:.4f}' for w in weights]}")
-    print(f"  软目标 Lab: L={L_sum:.1f} a={a_sum:.1f} b={b_sum:.1f}")
-
-    return L_sum, a_sum, b_sum
+    # gap12 >= 0.05 且 gap13 >= 0.20 或仅1个颜色，自动选择第1名
+    selected_lab = sorted_colors[0]["lab"]
+    print(f"  自动选择第1名: Lab={selected_lab}")
+    return selected_lab[0], selected_lab[1], selected_lab[2], confidence
 
 
 # ─── 断点管理 ────────────────────────────────────────────────────────────
@@ -294,27 +284,28 @@ def load_batch_checkpoint():
 
 # ─── 单批次处理 ──────────────────────────────────────────────────────────
 
-def process_one_batch(batch_targets):
+def process_one_batch(batch_targets, quick=False):
     """执行一次完整批次：下载 → graphcolor → 生成 targets"""
     print(f"\n{'='*60}")
     print(f"  开始新批次：下载 {BATCH_SIZE} 张 Pixiv 随机图片...")
+    if quick:
+        print(f"  [Quick模式] 本批次图片将保留至 extracted_imgs/imgs/pixiv_imgs/")
     print(f"{'='*60}")
 
     # 1. 获取 URL 并下载
     url_infos = fetch_pixiv_urls(BATCH_SIZE)
     if not url_infos:
         print("  未获取到有效图片 URL，跳过此批次")
-        return batch_targets
+        return batch_targets, (None if quick else None)
 
     local_paths, valid_infos = download_images(url_infos, TEMP_DIR)
     if len(local_paths) < 1:
         print("  没有成功下载任何图片，跳过此批次")
-        return batch_targets
+        return batch_targets, (None if quick else None)
 
-    # 只处理前 PROCESS_COUNT 张
-    to_process = valid_infos[:PROCESS_COUNT]
+    to_process = valid_infos
     to_process_paths = [info["local_path"] for info in to_process]
-    print(f"\n  共下载 {len(local_paths)} 张，将处理前 {len(to_process_paths)} 张...")
+    print(f"\n  共下载 {len(local_paths)} 张，将全部处理...")
 
     # 2. 运行 graphcolor
     results_path = os.path.join(TEMP_DIR, "result.json")
@@ -328,45 +319,67 @@ def process_one_batch(batch_targets):
         )
     except Exception as e:
         print(f"  graphcolor 处理失败: {e}")
-        return batch_targets
+        return batch_targets, (None if quick else None)
 
     # 3. 将 results 转换为 targets（存储源 URL）
+    kept_paths = set()  # quick模式：记录成功保留的图片路径
     for i, result in enumerate(graph_results):
         info = to_process[i]
         img_filename = info["local_name"]
         src_url = info["url"]
 
         fg_colors = result["foreground"]["main_colors"]
-        L_fg, a_fg, b_fg = process_colors(fg_colors, info, "fg")
+        L_fg, a_fg, b_fg, fg_conf = process_colors(fg_colors, info, "fg")
         if L_fg is None:
             print(f"  跳过 {img_filename}")
+            if quick:
+                os.remove(info["local_path"])  # quick模式下删除被跳过的图片
             continue
 
         bg_colors = result["background"]["main_colors"]
-        L_bg, a_bg, b_bg = process_colors(bg_colors, info, "bg")
+        L_bg, a_bg, b_bg, bg_conf = process_colors(bg_colors, info, "bg")
         if L_bg is None:
             print(f"  跳过 {img_filename}（背景阶段）")
+            if quick:
+                kept_paths.discard(info["local_path"])  # 从保留列表中移除
+                os.remove(info["local_path"])  # quick模式下删除被跳过的图片
             continue
 
         batch_targets[src_url] = {
             "L_fg": round(L_fg, 1), "a_fg": round(a_fg, 1), "b_fg": round(b_fg, 1),
+            "fg_conf": round(fg_conf, 4),
             "L_bg": round(L_bg, 1), "a_bg": round(a_bg, 1), "b_bg": round(b_bg, 1),
+            "bg_conf": round(bg_conf, 4),
             "pixiv_id": info["pid"],
             "title": info["title"],
             "author": info["author"],
             "tags": info["tags"],
         }
+        if quick:
+            kept_paths.add(info["local_path"])
 
     # 保存断点
     save_batch_checkpoint(batch_targets, TEMP_DIR)
-    return batch_targets
+    
+    # quick模式返回 kept_paths 供后续转移
+    if quick:
+        return batch_targets, kept_paths
+    return batch_targets, None
 
 
 # ─── 主循环 ──────────────────────────────────────────────────────────────
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Pixiv 蒸馏目标生成器")
+    parser.add_argument('--quick', action='store_true', help='Quick模式：每批次图片保留至 extracted_imgs/imgs/pixiv_imgs/，不删除')
+    args = parser.parse_args()
+    quick = args.quick
+
     print("Pixiv 蒸馏目标生成器")
-    print(f"  每次下载 {BATCH_SIZE} 张，处理前 {PROCESS_COUNT} 张")
+    print(f"  每次下载并处理 {BATCH_SIZE} 张 Pixiv 随机图片")
+    if quick:
+        print(f"  [Quick模式] 本批次图片将保留至 extracted_imgs/imgs/pixiv_imgs/")
     print(f"  按 Ctrl+C 可安全退出\n")
 
     batch_targets = {}
@@ -400,15 +413,34 @@ def main():
         print(f"  第 {batch_num} 批次 (当前总计 {len(batch_targets)} 条)")
         print(f"{'#'*60}")
 
-        batch_targets = process_one_batch(batch_targets)
+        batch_targets, batch_valid_infos = process_one_batch(batch_targets, quick)
 
         # 4. 保存一版 target_pixiv_{time}.json
         merge_to_final(batch_targets)
 
-        # 5. 移除临时图片
-        if os.path.exists(TEMP_DIR):
-            shutil.rmtree(TEMP_DIR, ignore_errors=True)
-            print(f"  临时文件已清理")
+        # 5. 处理临时图片
+        if quick:
+            # Quick模式：仅转移被保留的图片（跳过/失败的图片已删除）
+            pixiv_dir = os.path.join('extracted_imgs', 'imgs', 'pixiv_imgs')
+            os.makedirs(pixiv_dir, exist_ok=True)
+            moved_count = 0
+            if batch_valid_infos:
+                for src_path in batch_valid_infos:
+                    fname = os.path.basename(src_path)
+                    dst = os.path.join(pixiv_dir, fname)
+                    if not os.path.exists(dst):
+                        shutil.move(src_path, dst)
+                        moved_count += 1
+                    else:
+                        os.remove(src_path)
+            # 清理临时目录
+            if os.path.exists(TEMP_DIR):
+                shutil.rmtree(TEMP_DIR, ignore_errors=True)
+            print(f"  [Quick模式] 已转移 {moved_count} 张图片至 {pixiv_dir}/")
+        else:
+            if os.path.exists(TEMP_DIR):
+                shutil.rmtree(TEMP_DIR, ignore_errors=True)
+                print(f"  临时文件已清理")
 
         print(f"\n  第 {batch_num} 批次完成，当前总计 {len(batch_targets)} 条")
         print(f"  按 Ctrl+C 退出，或等待自动开始下一批次...")
