@@ -55,5 +55,4 @@ best_model*.pth
 *.jpg
 *.png
 
-*.spec
 *.json
