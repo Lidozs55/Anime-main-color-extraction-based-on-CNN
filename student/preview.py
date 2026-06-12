@@ -74,6 +74,7 @@ def main():
     parser.add_argument('--model', default=None, help='模型权重路径（默认: student/best_model.pth）')
     parser.add_argument('--output-dir', default=None, help='输出目录（默认: ../outputs/model_previews）')
     parser.add_argument('--img-dir', default=None, help='图片目录（默认: ../extracted_imgs/imgs + pixiv_imgs）')
+    parser.add_argument('--img', default=None, help='单张图片路径（指定后只处理这一张）')
     args = parser.parse_args()
 
     model_path = args.model or os.path.join(SCRIPT_DIR, 'best_model.pth')
@@ -93,7 +94,14 @@ def main():
     model.eval()
 
     # 收集图片
-    all_paths = collect_images(img_dir, pixiv_dir)
+    if args.img:
+        matched = sorted(glob.glob(args.img))
+        if not matched:
+            print(f"错误: 未匹配到图片: {args.img}")
+            sys.exit(1)
+        all_paths = matched
+    else:
+        all_paths = collect_images(img_dir, pixiv_dir)
     if not all_paths:
         print(f"错误: 在 {img_dir} 中未找到任何图片")
         sys.exit(1)

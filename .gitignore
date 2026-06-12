@@ -50,3 +50,10 @@ best_model*.pth
 
 #zip
 *.zip
+
+# Images
+*.jpg
+*.png
+
+*.spec
+*.json

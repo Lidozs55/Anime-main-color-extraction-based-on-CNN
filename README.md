@@ -2,6 +2,8 @@
 
 手绘动漫图片主色提取工具。从动漫/插画中智能提取前景（主体）和背景的主色调，输出颜色评分、色值及可视化结果。
 
+包含一个**学生模型蒸馏管线**：通过教师模型（graphcolor pipeline）生成软目标，训练轻量 CNN 直接从图片预测前景/背景主色。
+
 ## 特性
 
 - **智能主体分割**：支持多种分割方案，按优先级回退
@@ -13,6 +15,7 @@
 - **多维度评分体系**：综合像素占比、亮度均匀性、空间中心距离、视觉显著性四个因子，对每个聚类进行综合评分
 - **批量处理**：支持多图片/通配符/zip 批量输入，支持多进程并行
 - **可视化输出**：生成带主色色块的结果图与主体蒙版分割可视化图
+- **学生模型蒸馏**：轻量 CNN（~43K 参数）通过 confidence-weighted loss 从教师模型学习，支持梯度累积全量训练
 
 ## 安装
 
@@ -25,20 +28,18 @@ scikit-learn>=1.3.0
 Pillow>=10.0.0
 ```
 
-### 可选依赖（深度学习分割）
-
-如需使用默认的深度学习分割器，还需安装：
+### 可选依赖（深度学习分割 + 学生模型训练）
 
 ```
-pip install rembg
+pip install rembg torch torchvision
 ```
 
 ### 安装步骤
 
 ```bash
 pip install -r requirements.txt
-# 可选：安装 rembg（深度学习分割）
-pip install rembg
+# 可选：安装 rembg（深度学习分割）和 PyTorch（学生模型训练）
+pip install rembg torch torchvision
 ```
 
 ## 快速开始
@@ -79,6 +80,140 @@ python main.py image.png --visual-dir ./previews --seg-visual-dir ./seg_visuals
 python main.py "images/*.png" -j 4 --output results.json
 ```
 
+## 学生模型蒸馏管线
+
+### 整体流程
+
+```
+教师模型 (graphcolor pipeline)
+  │
+  ▼
+generate_targets.py / generate_targets_pixiv.py
+  │  从 results.json 中选取人类认可的颜色作为 target
+  │  每个 target 包含: L/a/b × 前景/背景 + 置信度 (fg_conf/bg_conf)
+  │
+  ▼
+targets.json / targets_pixiv_*.json
+  │
+  ▼
+student/train.py
+  │  梯度累积全量训练 + confidence-weighted loss
+  │  val_loss 模型选择 + early stopping
+  │
+  ▼
+student/best_model.pth
+  │
+  ▼
+student/eval.py  →  单图推理验证
+student/export.py → 导出模型信息
+```
+
+### 生成蒸馏目标
+
+**本地图片**（从 `outputs/results.json` 交互校正）：
+
+```bash
+# 先运行教师模型
+python main.py "images/*.png" -o outputs/results.json
+
+# 交互校正生成 targets.json
+python generate_targets.py
+```
+
+**Pixiv 图片**（自动下载 + 交互校正）：
+
+```bash
+# 循环下载 Pixiv 随机图片，每批 20 张
+python generate_targets_pixiv.py
+
+# Quick 模式：保留图片到 extracted_imgs/imgs/pixiv_imgs/
+python generate_targets_pixiv.py --quick
+```
+
+**人工标注触发条件**：
+- `gap12 < 0.05`：前 2 名分数差距不足 5%，难以自动区分
+- `gap13 < 0.20`：前 3 名分数差距不足 20%，候选颜色区分度不足
+
+可选颜色上限为 5 个（pipeline 输出最多 5 个主色），不足 5 个时显示实际数量。
+
+### 训练学生模型
+
+```bash
+cd student
+
+# 从头训练
+python train.py --episodes 200 --patience 30
+
+# 断点续训（自动从最佳模型恢复）
+python train.py --episodes 200 --patience 50
+
+# 自定义参数
+python train.py --lr 5e-4 --batch-size 16 --ema-alpha 0.1
+```
+
+**训练策略**：
+
+| 特性 | 说明 |
+|------|------|
+| 梯度累积 | 遍历全集后统一 update，消除 batch 分布偏差 |
+| Confidence-weighted loss | 高置信样本梯度更大，低置信样本被降权 |
+| 检查点恢复 | 从最佳模型权重重新开始，重置 optimizer/scheduler |
+| 模型选择 | 基于 val_loss（70/30 拆分的真实泛化信号） |
+| 正则化 | Dropout(0.2) + WeightDecay(1e-4) + 梯度裁剪(5.0) |
+
+**命令行参数**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--episodes` | 200 | 训练总 epoch 数 |
+| `--batch-size` | 32 | mini-batch size（梯度累积用） |
+| `--patience` | 30 | early stopping patience |
+| `--lr` | 1e-3 | 学习率 |
+| `--ema-alpha` | 0.1 | EMA 平滑系数 |
+
+### 评估与导出
+
+```bash
+cd student
+
+# 单图评估
+python eval.py --image ../path/to/image.png
+
+# 导出模型信息
+python export.py
+```
+
+## 学生模型架构
+
+基于 MobileNetV2 风格的 MBConv（Mobile Bottleneck Convolution）：
+
+```
+Input (3×128×128)
+  │
+  ▼
+Stem: Conv2d(3→16, k3, s2) + BN + ReLU6
+  │
+  ▼
+MBConv Block1: 16→16, s1, expand=2  ─┐
+MBConv Block2: 16→24, s2, expand=4   │ 提取特征
+MBConv Block3: 24→24, s1, expand=4   │ (逐层升维)
+MBConv Block4: 24→32, s2, expand=6   │
+MBConv Block5: 32→32, s1, expand=6  ─┘
+  │
+  ▼
+Fusion: Conv2d(32→64, k1) + BN + ReLU6
+  │
+  ├─→ Mask Head: Conv2d(64→1, k1) + Sigmoid → 前景/背景权重图
+  │
+  ├─→ FG FC: GAP(mask×feat) → Linear(64→32) → Dropout(0.2) → Linear(32→3) → 前景 Lab
+  │
+  └─→ BG FC: GAP((1-mask)×feat) → Linear(64→32) → Dropout(0.2) → Linear(32→3) → 背景 Lab
+```
+
+- 总参数量：~43K
+- 输出：前景 Lab (L/a/b) + 背景 Lab (L/a/b) + 分割 mask
+- L 通道范围 [0, 100]（sigmoid × 100），a/b 通道范围 [-128, 128]（tanh × 128）
+
 ## 命令行参数
 
 | 参数 | 简写 | 默认值 | 说明 |
@@ -91,9 +226,9 @@ python main.py "images/*.png" -j 4 --output results.json
 | `--max-size` | - | 512 | 缩放后图片最长边像素数 |
 | `--clusters-fg` | - | 10 | 前景聚类数 |
 | `--clusters-bg` | - | 6 | 背景聚类数 |
-| `--color-weight` | - | 1.0 | 颜色通道（a*/b*）基权重 |
-| `--lightness-weight` | - | 0.5 | 亮度通道（L*）权重 |
-| `--a-boost` | - | 1.1 | a* 通道额外放大倍数 |
+| `--color-weight` | - | 1.0 | 颜色通道（a\*/b\*）基权重 |
+| `--lightness-weight` | - | 0.5 | 亮度通道（L\*）权重 |
+| `--a-boost` | - | 1.1 | a\* 通道额外放大倍数 |
 | `--workers` | `-j` | 1 | 并行进程数 |
 
 ## 处理流程
@@ -172,23 +307,44 @@ python main.py "images/*.png" -j 4 --output results.json
 ]
 ```
 
+### targets.json 示例
+
+```json
+{
+  "image.png": {
+    "L_fg": 45.2, "a_fg": 18.5, "b_fg": -22.3, "fg_conf": 0.7234,
+    "L_bg": 85.0, "a_bg": -2.1, "b_bg": 15.6, "bg_conf": 0.6512
+  }
+}
+```
+
 ## 项目结构
 
 ```
-graphcolor/
-├── __init__.py         # 模块入口
-├── pipeline.py         # 处理管线编排（主流程）
-├── preprocess.py       # 加载、缩放、Lab 转换
-├── segment.py          # 主体/背景分割（NeuralSegmenter + ForegroundSegmenter）
-├── cluster.py          # Lab 空间加权聚类
-├── scoring.py          # 四因子评分与主色提取
-└── visualize.py        # 结果可视化（色块叠加、分割蒙版可视化）
-main.py                 # CLI 入口
-requirements.txt        # Python 依赖
-GRAPHCOLOR_SPEC.md      # 完整算法规范（含所有公式）
-test_pipeline.py        # 测试脚本
-analyze_fg.py           # 前景主色分析
-analyze_bg.py           # 背景主色分析
+GraphColor/
+├── graphcolor/                 # 教师模型（主色提取 pipeline）
+│   ├── __init__.py
+│   ├── pipeline.py             # 处理管线编排（主流程）
+│   ├── preprocess.py           # 加载、缩放、Lab 转换
+│   ├── segment.py              # 主体/背景分割
+│   ├── cluster.py              # Lab 空间加权聚类
+│   ├── scoring.py              # 四因子评分与主色提取
+│   ├── visualize.py            # 结果可视化
+│   └── html_visualize.py       # HTML 可视化
+│
+├── student/                    # 学生模型（CNN 蒸馏）
+│   ├── model.py                # ColorNetMasked 架构（MBConv + mask head）
+│   ├── dataset.py              # ColorDataset（支持 Pixiv URL 自动下载）
+│   ├── train.py                # 训练脚本（梯度累积 + confidence-weighted loss）
+│   ├── eval.py                 # 单图评估脚本
+│   └── export.py               # 模型导出脚本
+│
+├── main.py                     # 教师模型 CLI 入口
+├── generate_targets.py         # 本地图片蒸馏目标生成（交互校正）
+├── generate_targets_pixiv.py   # Pixiv 图片蒸馏目标生成（自动下载 + 交互校正）
+├── requirements.txt
+├── GRAPHCOLOR_SPEC.md          # 完整算法规范
+└── README.md
 ```
 
 ## 算法规范
@@ -247,7 +403,7 @@ results = process_batch(
 |------|------|------|
 | `color_weight` | 颜色通道权重 | 增大 → 聚类更关注色相 |
 | `lightness_weight` | 亮度权重 | 降低（0.1~0.3）使相近色相不同明度归为一类 |
-| `a_boost` | a* 通道放大 | 略大于 1.0 可提升红绿区分度 |
+| `a_boost` | a\* 通道放大 | 略大于 1.0 可提升红绿区分度 |
 
 ### 评分参数
 

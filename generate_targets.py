@@ -154,10 +154,10 @@ def process_colors(colors, img_filename, region_type, img_dir):
 
     sorted_colors = sorted(colors, key=lambda c: c['score'], reverse=True)[:n_colors]
 
-    # 计算 teacher 置信度
+    # 计算 teacher 置信度：score1/(2*score2)，clip 到 1.0
     if n_colors >= 2:
         s1, s2 = sorted_colors[0]['score'], sorted_colors[1]['score']
-        confidence = s1 / (s1 + s2) if (s1 + s2) > 0 else 1.0
+        confidence = min(s1 / (2 * s2), 1.0) if s2 > 0 else 1.0
     else:
         confidence = 1.0
 
@@ -212,7 +212,7 @@ def process_colors(colors, img_filename, region_type, img_dir):
 
                 selected_lab = sorted_colors[choice - 1]['lab']
                 print(f"  用户选择第{choice}名: Lab={selected_lab}")
-                return selected_lab[0], selected_lab[1], selected_lab[2], confidence
+                return selected_lab[0], selected_lab[1], selected_lab[2], 1.0
     else:
         print(f"  仅 {n_colors} 个颜色，自动选择第1名")
 
@@ -220,6 +220,42 @@ def process_colors(colors, img_filename, region_type, img_dir):
     selected_lab = sorted_colors[0]['lab']
     print(f"  自动选择第1名: Lab={selected_lab}")
     return selected_lab[0], selected_lab[1], selected_lab[2], confidence
+
+
+def migrate_confidence(targets_path='targets.json'):
+    """
+    迁移旧版 targets.json 中的置信度：
+    - conf < 0.52 → 人类标注，设为 1.0
+    - 其他：旧公式 score1/(score1+score2) 转换为新公式 min(score1/(2*score2), 1.0)
+      推导：confidence_new = confidence_old / (2*(1-confidence_old))
+    """
+    if not os.path.exists(targets_path):
+        print(f"未找到 {targets_path}")
+        return
+
+    with open(targets_path, 'r', encoding='utf-8') as f:
+        targets = json.load(f)
+
+    fixed_human = 0
+    fixed_convert = 0
+    for url, entry in targets.items():
+        for key in ['fg_conf', 'bg_conf']:
+            if key not in entry:
+                continue
+            old_conf = entry[key]
+            if old_conf < 0.52:
+                entry[key] = 1.0
+                fixed_human += 1
+            elif old_conf < 0.999:
+                # 旧公式 → 新公式转换
+                new_conf = old_conf / (2 * (1 - old_conf))
+                entry[key] = round(min(new_conf, 1.0), 4)
+                fixed_convert += 1
+
+    with open(targets_path, 'w', encoding='utf-8') as f:
+        json.dump(targets, f, indent=2, ensure_ascii=False)
+
+    print(f"已迁移 {len(targets)} 条数据: {fixed_human} 条人类标注→1.0, {fixed_convert} 条公式转换")
 
 
 def main():
@@ -325,4 +361,10 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    import sys
+    if '--migrate' in sys.argv:
+        idx = sys.argv.index('--migrate')
+        path = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else 'targets.json'
+        migrate_confidence(path)
+    else:
+        main()
