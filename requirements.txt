@@ -1,0 +1,17 @@
+# ───── 必需依赖（label.py 标注工具）─────
+numpy>=1.24.0
+opencv-python-headless>=4.8.0
+scikit-learn>=1.3.0
+Pillow>=10.0.0
+flask>=3.0.0
+
+# ───── 神经分割依赖（graphcolor NeuralSegmenter 选用）─────
+rembg>=2.0.0
+onnxruntime>=1.15.0
+
+# ───── CNN 学生模型训练依赖（student/）─────
+torch>=2.0.0
+torchvision>=0.15.0
+
+# ───── 打包单 exe 可选依赖（label_APP.spec）─────
+pyinstaller>=6.0.0

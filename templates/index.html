@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pixiv 标注工具</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+         background: #1a1a2e; color: #eee; height: 100vh;
+         display: flex; flex-direction: column; }
+
+  .header { display: flex; justify-content: space-between; align-items: center;
+            padding: 12px 20px; background: #16213e; border-bottom: 1px solid #333; }
+  .header h1 { font-size: 18px; color: #5b9bd5; }
+  .stats { font-size: 14px; color: #aaa; }
+  .stats span { color: #5b9bd5; font-weight: 600; }
+
+  .main { flex: 1; display: flex; gap: 0; overflow: hidden; }
+  .img-panel { flex: 1; display: flex; align-items: center; justify-content: center;
+               padding: 20px; background: #0f0f23; overflow: auto; }
+  .img-panel img { max-width: 100%; max-height: 100%; object-fit: contain;
+                   border-radius: 8px; }
+
+  .ctrl-panel { width: 340px; padding: 20px; background: #16213e;
+                overflow-y: auto; display: flex; flex-direction: column; gap: 18px; }
+
+  .region-badge { display: inline-block; padding: 8px 20px; border-radius: 6px;
+                  font-weight: 700; font-size: 18px; letter-spacing: 2px; }
+  .region-fg { background: #5b9bd5; color: #fff; box-shadow: 0 2px 8px rgba(91,155,213,0.4); }
+  .region-bg { background: #2d6a9f; color: #fff; box-shadow: 0 2px 8px rgba(45,106,159,0.4); }
+
+  .section-title { font-size: 13px; color: #888; margin-bottom: 8px; }
+
+  .candidates { display: flex; flex-wrap: wrap; gap: 10px; }
+  .cand-item { display: flex; flex-direction: column; align-items: center;
+               cursor: pointer; padding: 8px; border-radius: 8px;
+               border: 2px solid transparent; transition: all 0.2s; }
+  .cand-item:hover { background: rgba(255,255,255,0.05); }
+  .cand-item.active { border-color: #5b9bd5; }
+  .cand-swatch { width: 52px; height: 52px; border-radius: 8px;
+                 border: 1px solid rgba(255,255,255,0.15); }
+  .cand-label { font-size: 11px; color: #aaa; margin-top: 4px; }
+
+  .picker-section { display: flex; flex-direction: column; gap: 10px; }
+  .picker-row { display: flex; align-items: center; gap: 12px; }
+  .color-input { width: 64px; height: 44px; border: none; cursor: pointer;
+                 border-radius: 6px; background: none; padding: 0; }
+  .color-input::-webkit-color-swatch-wrapper { padding: 2px; }
+  .color-input::-webkit-color-swatch { border-radius: 4px;
+                 border: 1px solid rgba(255,255,255,0.2); }
+  .hex-input { flex: 1; height: 44px; background: #0f0f23; border: 1px solid #444;
+               border-radius: 6px; color: #fff; padding: 0 12px;
+               font-family: monospace; font-size: 15px; }
+  .hex-input:focus { outline: none; border-color: #5b9bd5; }
+  .preview-circle { width: 44px; height: 44px; border-radius: 50%;
+                    border: 2px solid rgba(255,255,255,0.2); flex-shrink: 0; }
+
+  .actions { display: flex; gap: 10px; margin-top: auto; }
+  .btn { flex: 1; height: 48px; border: none; border-radius: 8px;
+         font-size: 15px; font-weight: 600; cursor: pointer;
+         transition: all 0.2s; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-submit { background: #5b9bd5; color: #fff; }
+  .btn-submit:hover:not(:disabled) { background: #4a8bc4; }
+  .btn-skip { background: #333; color: #aaa; }
+  .btn-skip:hover:not(:disabled) { background: #444; color: #fff; }
+  .btn-exit { padding: 6px 16px; background: #d9534f; color: #fff; border: none;
+              border-radius: 4px; font-size: 13px; cursor: pointer; transition: all 0.2s; }
+  .btn-exit:hover { background: #c9302c; }
+  .btn-exit:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .info-bar { padding: 8px 20px; background: #0f0f23; border-top: 1px solid #333;
+              font-size: 12px; color: #666; text-align: center; }
+
+  .mode-pill { display: inline-block; padding: 2px 10px; margin-left: 12px;
+               font-size: 12px; border-radius: 10px; background: #2d6a9f;
+               color: #fff; vertical-align: middle; }
+
+  .waiting { text-align: center; padding: 40px 20px; }
+  .waiting h2 { color: #5b9bd5; margin-bottom: 8px; font-size: 20px; }
+  .waiting p { color: #888; font-size: 14px; }
+  .spinner { display: inline-block; width: 24px; height: 24px;
+             border: 3px solid #333; border-top-color: #5b9bd5;
+             border-radius: 50%; animation: spin 0.8s linear infinite;
+             margin-bottom: 12px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .error { text-align: center; padding: 40px 20px; }
+  .error h2 { color: #5b9bd5; margin-bottom: 8px; }
+  .error p { color: #888; }
+  .error .btn { display: inline-block; flex: none; width: auto; padding: 0 24px;
+                margin-top: 16px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Pixiv 标注工具<span class="mode-pill" id="modePill">模式加载中</span></h1>
+  <div style="display:flex;align-items:center;gap:16px;">
+    <div class="stats">已标 <span id="s-ann">0</span> | 跳过 <span id="s-skip">0</span> | 下载 <span id="s-dl">0</span></div>
+    <button class="btn-exit" id="btnExit" onclick="doExit()">退出系统</button>
+  </div>
+</div>
+
+<div class="main" id="main">
+  <div class="waiting" style="width:100%">
+    <div class="spinner"></div>
+    <h2>等待图片...</h2>
+    <p>流水线正在下载和计算中</p>
+  </div>
+</div>
+
+<div class="info-bar" id="info-bar">就绪</div>
+
+<script>
+let currentData = null;
+let currentTaskId = null;  // 追踪当前任务，避免重复渲染
+let isUserInteracting = false;  // 用户是否正在交互
+let isExiting = false;  // 是否正在退出
+
+function updateStats() {
+  fetch('/api/stats').then(r => r.json()).then(d => {
+    document.getElementById('s-ann').textContent = d.annotated;
+    document.getElementById('s-skip').textContent = d.skipped;
+    document.getElementById('s-dl').textContent = d.downloaded;
+  }).catch(() => {});
+}
+setInterval(updateStats, 3000);
+updateStats();
+
+function updateMode() {
+  fetch('/api/mode').then(r => r.json()).then(d => {
+    const pill = document.getElementById('modePill');
+    if (d && d.mode) {
+      const tag = d.quick ? ' [Quick]' : '';
+      pill.textContent = d.mode + tag;
+    }
+  }).catch(() => {});
+}
+updateMode();
+
+function getTaskId(data) {
+  if (!data || !data.has_task) return null;
+  return `${data.image_name}_${data.region_type}`;
+}
+
+function renderTask(data) {
+  const newTaskId = getTaskId(data);
+
+  // 如果任务没变化，不重新渲染
+  if (newTaskId === currentTaskId && currentData && currentData.has_task) {
+    return;
+  }
+
+  // 有新任务到来时（用户完成上一个任务后），清除交互标记
+  if (newTaskId && !currentTaskId) {
+    isUserInteracting = false;
+  }
+
+  // 如果用户正在交互且不是新任务，跳过
+  if (isUserInteracting && newTaskId === currentTaskId) {
+    return;
+  }
+
+  currentData = data;
+  currentTaskId = newTaskId;
+  const main = document.getElementById('main');
+
+  if (!data || !data.has_task) {
+    main.innerHTML = `<div class="waiting">
+      <div class="spinner"></div>
+      <h2>等待图片...</h2>
+      <p>流水线正在下载和计算中</p>
+    </div>`;
+    document.getElementById('info-bar').textContent = '等待新任务...';
+    return;
+  }
+
+  const cands = data.candidates || [];
+  const defHex = cands.length > 0 ? cands[0].hex : '#888888';
+  const regionClass = data.region_type === 'fg' ? 'region-fg' : 'region-bg';
+
+  let candsHtml = '';
+  cands.forEach((c, i) => {
+    candsHtml += `<div class="cand-item" data-hex="${c.hex}" onclick="pickCand(this, '${c.hex}')">
+      <div class="cand-swatch" style="background:${c.hex}"></div>
+      <div class="cand-label">#${i+1} ${(c.score*100).toFixed(1)}%</div>
+    </div>`;
+  });
+
+  main.innerHTML = `
+    <div class="img-panel">
+      <img src="/temp/${data.image_name}" alt="图片">
+    </div>
+    <div class="ctrl-panel">
+      <div>
+        <span class="region-badge ${regionClass}">${data.region_label}</span>
+        <span style="margin-left:10px;font-size:13px;color:#888">${data.task_name}</span>
+      </div>
+
+      <div>
+        <div class="section-title">候选颜色（点击选择）</div>
+        <div class="candidates" id="cands">${candsHtml}</div>
+      </div>
+
+      <div class="picker-section">
+        <div class="section-title">或使用调色盘选色</div>
+        <div class="picker-row">
+          <input type="color" class="color-input" id="colorPicker" value="${defHex}">
+          <input type="text" class="hex-input" id="hexInput" value="${defHex}" maxlength="7" placeholder="#RRGGBB">
+          <div class="preview-circle" id="preview" style="background:${defHex}"></div>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button class="btn btn-submit" id="btnSubmit" onclick="doSubmit()">提交</button>
+        <button class="btn btn-skip" id="btnSkip" onclick="doSkip()">跳过</button>
+      </div>
+    </div>`;
+
+  document.getElementById('info-bar').textContent =
+    `${data.trigger_reason} | ${data.task_name}`;
+
+  // 绑定事件，标记用户正在交互
+  const picker = document.getElementById('colorPicker');
+  const hexIn = document.getElementById('hexInput');
+  const preview = document.getElementById('preview');
+
+  picker.addEventListener('input', () => {
+    hexIn.value = picker.value;
+    preview.style.background = picker.value;
+    clearActive();
+    isUserInteracting = true;
+  });
+  picker.addEventListener('change', () => {
+    // 调色盘关闭后延迟重置标记
+    setTimeout(() => { isUserInteracting = false; }, 2000);
+  });
+  hexIn.addEventListener('input', () => {
+    const v = hexIn.value;
+    if (/^#[0-9a-fA-F]{6}$/.test(v)) {
+      picker.value = v;
+      preview.style.background = v;
+      clearActive();
+      isUserInteracting = true;
+    }
+  });
+}
+
+function clearActive() {
+  document.querySelectorAll('.cand-item').forEach(el => el.classList.remove('active'));
+}
+
+function pickCand(el, hex) {
+  clearActive();
+  el.classList.add('active');
+  document.getElementById('colorPicker').value = hex;
+  document.getElementById('hexInput').value = hex;
+  document.getElementById('preview').style.background = hex;
+  isUserInteracting = true;
+  // 候选颜色选择后短暂标记
+  setTimeout(() => { isUserInteracting = false; }, 2000);
+}
+
+function setButtons(disabled) {
+  document.getElementById('btnSubmit').disabled = disabled;
+  document.getElementById('btnSkip').disabled = disabled;
+}
+
+function doSubmit() {
+  const hex = document.getElementById('hexInput').value;
+  if (!/^#[0-9a-fA-F]{6}$/.test(hex)) { alert('请输入有效的颜色值'); return; }
+  setButtons(true);
+  fetch('/api/submit', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({hex: hex})
+  }).then(r => r.json()).then(d => {
+    if (d.ok) {
+      currentTaskId = null;  // 清除任务ID，允许加载新任务
+      setTimeout(fetchTask, 200);
+    }
+    else { setButtons(false); alert(d.error || '提交失败'); }
+  }).catch(() => setButtons(false));
+}
+
+function doSkip() {
+  setButtons(true);
+  fetch('/api/skip', {method: 'POST'})
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) {
+        currentTaskId = null;  // 清除任务ID，允许加载新任务
+        setTimeout(fetchTask, 200);
+      } else { setButtons(false); }
+    })
+    .catch(() => setButtons(false));
+}
+
+function doExit() {
+  if (!confirm('确定要退出标注系统吗？\n将保存当前进度（包括下载池和标注队列中的数据）。')) return;
+
+  isExiting = true;  // 立即停止轮询
+  document.getElementById('btnExit').disabled = true;
+  document.getElementById('btnExit').textContent = '正在保存...';
+
+  fetch('/api/exit', {method: 'POST'})
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) {
+        document.getElementById('main').innerHTML = `
+          <div style="width:100%;text-align:center;padding:40px;">
+            <h2 style="color:#5b9bd5;margin-bottom:16px;">已安全退出</h2>
+            <p style="color:#aaa;margin-bottom:8px;">${d.message}</p>
+            <p style="color:#888;font-size:13px;">可以关闭此页面，下次启动时将自动恢复进度。</p>
+          </div>`;
+        // 停止轮询
+        if (window._fetchInterval) clearInterval(window._fetchInterval);
+      } else {
+        alert('保存失败: ' + (d.error || '未知错误'));
+        document.getElementById('btnExit').disabled = false;
+        document.getElementById('btnExit').textContent = '退出系统';
+      }
+    })
+    .catch(e => {
+      alert('请求失败: ' + e.message);
+      document.getElementById('btnExit').disabled = false;
+      document.getElementById('btnExit').textContent = '退出系统';
+    });
+}
+
+function fetchTask() {
+  if (isExiting) return;
+  fetch('/api/current').then(r => r.json()).then(data => {
+    const newTaskId = getTaskId(data);
+    // 如果用户正在交互且任务没变化，跳过渲染
+    if (isUserInteracting && newTaskId === currentTaskId) return;
+    renderTask(data);
+  }).catch(() => {});
+}
+window._fetchInterval = setInterval(fetchTask, 1000);
+fetchTask();
+</script>
+</body>
+</html>

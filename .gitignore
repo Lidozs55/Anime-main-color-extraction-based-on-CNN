@@ -1,0 +1,52 @@
+# ───── AI 辅助规划产物（不要提交）─────
+.trae/
+
+# ───── 数据目录（仅保留 .gitkeep 占位）─────
+img/*
+!img/.gitkeep
+pixiv_img/*
+!pixiv_img/.gitkeep
+pixiv_temp/*
+!pixiv_temp/.gitkeep
+
+# ───── 标注输出（label.py 生成）─────
+targets_*.json
+label_progress.json
+label_progress_*.json.bak
+
+# ───── CNN 训练产物（student/）─────
+*.pth
+*.pt
+*.onnx
+outputs/
+
+# ───── PyInstaller 打包产物─────
+build/
+dist/
+build_env/
+*.spec.bak
+
+# ───── Python 缓存与虚拟环境─────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+.python-version
+
+# ───── IDE 与编辑器─────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ───── 临时文件─────
+*.tmp
+*.temp
+*.log
+*.bak
