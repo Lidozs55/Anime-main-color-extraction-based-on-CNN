@@ -1,12 +1,22 @@
 """
 HTML 可视化模块。
 
-将处理结果生成静态 HTML 页面，支持流式输出（处理一张追加一张）。
-每张图片展示：
+将处理结果生成静态 HTML 页面,支持流式输出(处理一张追加一张)。
+每张图片展示:
   - 原图
   - 主体提取图
-  - 前景主色（Top 5，按 score 排序）
-  - 背景主色（Top 5，按 score 排序）
+  - 前景主色(Top 5,按 score 排序)
+  - 背景主色(Top 5,按 score 排序)
+
+用法:
+    from graphcolor.html_visualize import HTMLVisualizer
+    viz = HTMLVisualizer("outputs/report.html")
+    for r in results:
+        viz.add_result(image_result_to_dict(r))
+    viz.close()
+
+或者直接从一个已存在的 results.json 一键生成:
+    generate_html_from_json("results.json", "report.html")
 """
 from pathlib import Path
 from typing import List, Optional
@@ -15,7 +25,12 @@ import json
 
 
 class HTMLVisualizer:
-    """HTML 可视化生成器，支持流式写入。"""
+    """HTML 可视化生成器,支持流式写入。
+
+    实例化时会立刻写入 HTML 头部(包含 CSS);
+    之后每调用一次 add_result() 追加一张图片的卡片;
+    最后调用 close() 闭合 </body></html>。
+    """
 
     # HTML 头部模板
     HTML_HEAD = """<!DOCTYPE html>

@@ -1,3 +1,18 @@
+"""ColorDataset - 学生模型训练/验证数据集。
+
+输入:
+  - img_dir              本地图片目录(单层,不递归)
+  - target_jsons         一个或多个 targets JSON 路径
+                         (label.py 生成的 targets.json / targets_*.json)
+  - split                'train' / 'val'  (前 80% 训练,后 20% 验证,按字典序)
+  - img_size             训练 / 评估时的方形边长
+  - pixiv_download_dir   Pixiv 图片目录,首次遇到 Pixiv URL 时按需下载
+
+输出 (__getitem__):
+  img_t    (3, H, W) float32 in [0, 1]
+  lab_fg   (3,) 前景点 Lab (L, a, b)
+  lab_bg   (3,) 背景点 Lab (L, a, b)
+"""
 import os, json, re
 import torch
 from torch.utils.data import Dataset

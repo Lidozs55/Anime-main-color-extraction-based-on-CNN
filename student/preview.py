@@ -21,14 +21,17 @@ IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
 
 
 def lab_to_bgr(L, a, b):
-    """Lab (标量) -> BGR (uint8)"""
+    """Lab (标量) -> BGR (uint8 三元组)"""
     lab_cv2 = np.array([[[L * 255 / 100.0, a + 128, b + 128]]], dtype=np.uint8)
     bgr = cv2.cvtColor(lab_cv2, cv2.COLOR_Lab2BGR)
     return tuple(int(v) for v in bgr[0, 0])
 
 
 def draw_swatch(bgr_img, fg_lab, bg_lab, swatch_size=None):
-    """在图片左下角叠加两个方形色块（前景、背景），与 graphcolor 格式一致。"""
+    """在图片左下角叠加两个方形色块(前景、背景),与 graphcolor 格式一致。
+
+    色块采用"白外描边 + 黑内描边"的双层描边,确保无论原图深浅都能看清。
+    """
     h, w = bgr_img.shape[:2]
     canvas = bgr_img.copy()
 
@@ -49,6 +52,7 @@ def draw_swatch(bgr_img, fg_lab, bg_lab, swatch_size=None):
         if x1 >= w:
             break
 
+        # 主色块 + 双层描边(白外 / 黑内),深浅底图都可见
         cv2.rectangle(canvas, (x1, y1), (x2 - 1, y2 - 1), bgr_color, cv2.FILLED)
         cv2.rectangle(canvas, (x1, y1), (x2 - 1, y2 - 1), (255, 255, 255), stroke)
         cv2.rectangle(canvas, (x1, y1), (x2 - 1, y2 - 1), (0, 0, 0), max(1, stroke // 2))
@@ -57,7 +61,7 @@ def draw_swatch(bgr_img, fg_lab, bg_lab, swatch_size=None):
 
 
 def collect_images(*dirs):
-    """收集多个目录下所有 jpg/png/webp 图片"""
+    """收集多个目录下所有 jpg/png/webp/bmp 图片(去重 + 排序)。"""
     paths = []
     for d in dirs:
         if not d or not os.path.isdir(d):

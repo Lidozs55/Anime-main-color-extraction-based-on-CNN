@@ -1,9 +1,20 @@
 """
 主体/背景分离模块。
 
-提供两种分割器：
-  - ForegroundSegmenter: 基于 OpenCV GrabCut 的多策略融合方案（轻量、无额外依赖）
-  - NeuralSegmenter: 基于 rembg 的深度学习显著性检测方案（更精准）
+提供两种分割器:
+  - ForegroundSegmenter: 基于 OpenCV GrabCut 的多策略融合方案(轻量、无额外依赖,
+                        适合 CPU / 无深度学习环境)
+  - NeuralSegmenter:    基于 rembg(U2-Net / IS-Net)的深度学习显著性检测方案
+                        (更精准,适合动漫/插画等复杂背景)
+
+此外还提供一些公共工具:
+  - SegmentResult          统一封装两个 mask + method + foreground_ratio
+  - _clean_foreground      形态学后处理 + 连通域过滤(去小斑点、填洞)
+  - _make_result / _result 把 bool mask 装成 SegmentResult
+  - _center_weight         距离图像中心的归一化权重,给 GrabCut 当作先验
+
+NeuralSegmenter.refine_mask() 是 pipeline 调用的关键:在拿到背景主色后,
+用它二次精修初始 mask, 解决"环状主体内部空洞被误识别为前景"的问题。
 """
 from dataclasses import dataclass
 from typing import Optional
@@ -14,7 +25,16 @@ import numpy as np
 
 @dataclass
 class SegmentResult:
-    """分割结果"""
+    """分割结果
+
+    Attributes:
+        foreground_mask:  (H, W) bool, 精修后的前景 mask(主要被后续 pipeline 使用的字段)
+        background_mask:  (H, W) bool, 前景的反面
+        method:           使用的方法名(grabcut_seeded / neural_isnet-general-use / ...),
+                          用于调试输出与可视化标注
+        foreground_ratio: 前景占总像素的比例(0~1),方便异常检测
+        initial_mask:     首次提取的 mask(未经 refine),仅 visualize 用来对比展示
+    """
     foreground_mask: np.ndarray      # bool, shape (H, W) - 精修后的前景mask
     background_mask: np.ndarray      # bool, shape (H, W)
     method: str                      # 使用的方法名
@@ -80,12 +100,19 @@ def _center_weight(h: int, w: int) -> np.ndarray:
 
 class ForegroundSegmenter:
     """
-    主体/背景分离器。
+    主体/背景分离器(传统方案,基于多线索 + GrabCut)。
 
-    3个核心参数（控制主体识别的激进程度）：
-      - chroma_threshold: 色度阈值，越低→更多彩色区域被纳入主体
-      - min_contour_area_ratio: 最小轮廓面积比，越低→保留更小的轮廓细节
-      - foreground_score_threshold: 前景得分阈值，越低→主体识别越激进
+    3个核心参数(控制主体识别的激进程度):
+      - chroma_threshold: 色度阈值,越低→更多彩色区域被纳入主体
+      - min_contour_area_ratio: 最小轮廓面积比,越低→保留更小的轮廓细节
+      - foreground_score_threshold: 前景得分阈值,越低→主体识别越激进
+
+    算法思路(segment):
+      1) 优先使用 alpha 通道(若 PNG 自带透明)
+      2) 在 Lab 空间下融合 4 条线索:chroma / 边缘 / 亮度中心 / 中心距离,
+         再扣去"和图像边缘颜色相近"的区域(避免把白墙等大片背景纳入主体)
+      3) 以"强前景 + 弱前景 + 弱背景"作为 GrabCut 的 mask 种子
+      4) 失败兜底:基于 score 的阈值法 / 椭圆中心
     """
 
     # 内部常量参数（次要，通常不需要调整）
@@ -291,10 +318,18 @@ class ForegroundSegmenter:
 
 class NeuralSegmenter:
     """
-    基于 rembg（U2-Net / IS-Net）的深度学习主体检测分割器。
+    基于 rembg(U2-Net / IS-Net)的深度学习主体检测分割器。
 
-    相比传统 GrabCut 方案，深度学习显著性检测对主体识别更精准，
+    相比传统 GrabCut 方案,深度学习显著性检测对主体识别更精准,
     尤其适合动漫/插画等复杂背景场景。
+
+    提供了三段式 API 供 pipeline 调用:
+      - extract_mask()  拉一次 rembg 得到初始 mask
+      - refine_mask()    用背景主色 + GrabCut 二次精修,解决"环状主体内部空洞"
+      - segment()       一站式便捷接口(内部自动完成精修)
+
+    也可以单独传一个 alpha_mask,优先级最高的还是 alpha 通道,
+    这对自带透明背景的 PNG(线稿/立绘)非常友好。
     """
 
     MODELS = {

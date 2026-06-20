@@ -1,3 +1,19 @@
+"""
+学生模型训练脚本。
+
+用法:
+    cd student
+    python train.py --episodes 60 --patience 15
+    python train.py --episodes 100 --batch-size 32 --lr 5e-4
+
+数据流程:
+    1) find_all_targets() 扫描项目根目录所有 targets*.json
+    2) ColorDataset 同时读取本地 img/ 与 pixiv_img/ 中的图片
+    3) 8:2 划分 train/val,训练集开启数据增强(翻转/旋转/随机裁剪)
+    4) AdamW + CosineAnnealingLR,val_loss 连续 --patience 轮不下降则早停
+    5) best_model.pth     仅 weights,val_loss 最佳时覆盖
+       checkpoint.pth     含 optimizer/scheduler/epoch,断点续训用
+"""
 import sys, os, glob, argparse
 import torch, torch.nn as nn, torch.optim as optim
 from torch.utils.data import DataLoader
@@ -11,14 +27,18 @@ from dataset import ColorDataset
 CHECKPOINT_FILE = 'checkpoint.pth'
 BEST_MODEL_FILE = 'best_model.pth'
 
-# 项目根目录（此脚本位于 student/ 下，根目录为上一级）
+# 项目根目录(此脚本位于 student/ 下,根目录为上一级)
 PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 DEFAULT_IMG_DIR = os.path.join(PROJECT_ROOT, 'img')
 DEFAULT_PIXIV_DIR = os.path.join(PROJECT_ROOT, 'pixiv_img')
 
 
 def find_all_targets(root_dir=None):
-    """查找所有 targets*.json 文件（默认在项目根目录）"""
+    """查找所有 targets*.json 文件(默认在项目根目录)。
+
+    顺序:targets.json 优先,然后按文件名排序的 targets_pixiv_*.json / targets_*.json。
+    这样保证多个 JSON 之间的 key 唯一性,可被 ColorDataset 合并加载。
+    """
     if root_dir is None:
         root_dir = PROJECT_ROOT
     targets = []

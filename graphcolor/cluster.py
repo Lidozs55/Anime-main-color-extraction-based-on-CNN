@@ -13,7 +13,14 @@ from dataclasses import dataclass
 
 @dataclass
 class ClusterResult:
-    """聚类结果"""
+    """聚类结果
+
+    Attributes:
+        labels:        (N,) 每个像素的聚类标签(从 0 开始连续编号)
+        centers_lab:   (k, 3) 聚类中心(标准 Lab,非缩放后)
+        n_pixels:      (k,) 每个聚类的像素数(按 n_pixels 降序)
+        proportions:   (k,) 像素占比(0~1 之和为 1)
+    """
     labels: np.ndarray               # (N,) 每个像素的聚类标签
     centers_lab: np.ndarray          # (k, 3) 聚类中心 (标准Lab)
     n_pixels: np.ndarray             # (k,) 每个聚类的像素数
@@ -22,7 +29,20 @@ class ClusterResult:
 
 class LabClusterer:
     """
-    Lab空间聚类器。
+    Lab 空间聚类器。
+
+    相比"把 L/a/b 平等看待"的朴素 K-Means,本类通过缩放
+    (L 降权 + a* 通道放大 + b* 通道标准权重)实现:
+
+        缩放后的距离 d² = w_L²·ΔL² + (w_ab·a_boost)²·Δa² + w_ab²·Δb²
+
+    目的有两个:
+      1) 颜色优先:同色相但不同明度的颜色更倾向聚成一类
+         (例如深红/暗红应同属"红色主色",而不是被 L 切碎)
+      2) 红绿更敏感:人类对 a* 方向的色差更敏感,放大后聚类结果更符合观感
+
+    使用 scikit-learn 的 MiniBatchKMeans,适合大批量像素;
+    训练完会把聚类中心还原到标准 Lab,并按像素占比降序输出。
     """
 
     def __init__(self, n_clusters: int = 8,

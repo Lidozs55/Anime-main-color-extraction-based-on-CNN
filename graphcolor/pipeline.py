@@ -3,6 +3,13 @@
 
 编排整个流程：
   加载 → resize → Lab转换 → 主体/背景分离 → 各自聚类 → 评分 → JSON/终端输出
+
+本模块是 `graphcolor` 教师模型的"门面":
+  - GraphColorPipeline.process()  处理单张图片
+  - GraphColorPipeline.process_batch()  处理多张图片(可选多进程)
+  - process_batch()  便捷函数,直接拿到 dict 列表
+  - image_result_to_dict()  把 ImageResult 转成可 JSON 序列化的 dict
+  - main()  命令行入口(`python -m graphcolor.pipeline ...`)
 """
 import json
 import time
@@ -62,7 +69,7 @@ DEFAULT_CONFIG = {
 
 class GraphColorPipeline:
     """
-    主色提取管线。
+    主色提取管线
     """
 
     def __init__(self, config: Optional[dict] = None):
@@ -128,8 +135,6 @@ class GraphColorPipeline:
 
     def process(self, image_path: str) -> ImageResult:
         """
-        处理单张图片。
-
         完整工作流（对于每张图片）：
         1. 获取图片（和相应的512*512压缩图片）
         2. 进行初步rembg主体提取
@@ -354,7 +359,13 @@ class GraphColorPipeline:
 
 
 def image_result_to_dict(result: ImageResult) -> dict:
-    """将ImageResult转换为可JSON序列化的字典"""
+    """
+    将 ImageResult 转换为可 JSON 序列化的字典。
+
+    序列化时只保留 image / segment_method / foreground / background 四个字段;
+    `MainColor` 中的 lab / rgb / hex / score / proportion 全部转成纯 python
+    类型(避免 numpy.float64 / numpy.int64 在 json.dump 时报错)。
+    """
     def color_to_dict(c: MainColor) -> dict:
         return {
             "lab": [round(float(c.lab[0]), 1),

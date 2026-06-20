@@ -11,6 +11,7 @@ pixiv_temp/*
 
 # ───── 标注输出（label.py 生成）─────
 targets_*.json
+targets.json
 label_progress.json
 label_progress_*.json.bak
 

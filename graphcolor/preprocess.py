@@ -1,5 +1,16 @@
 """
-图片加载、压缩与色彩空间转换模块
+图片加载、压缩与色彩空间转换模块。
+
+整条管线最底层的 IO / 色彩空间工具集:
+  - load_image()       读取图片文件,处理 Windows 下的非 ASCII 路径问题,
+                       对带 alpha 的 PNG 在白底上预合成(透明像素仍通过 alpha 单独返回)
+  - resize_to_max()    等比缩放,默认用 INTER_AREA(下采样抗锯齿效果好)
+  - load_and_resize()  上面两个的一步组合便捷函数
+  - bgr_to_lab()       OpenCV Lab 像素格式(0~255) -> 标准 Lab(L:0~100, a/b:-128~127)
+  - lab_to_bgr()       反向,标准 Lab -> BGR uint8
+  - lab_to_rgb_for_display()  适用于"一组像素"(N,3) 的批量可视化
+
+主色提取的所有算法都在 Lab 空间运行,所以这一步的色彩空间归一化至关重要。
 """
 import cv2
 import numpy as np

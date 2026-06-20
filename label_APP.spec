@@ -1,7 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec for label.py (前后端一体化标注工具)
-# 输出: dist/label_APP/label_APP.exe （单 exe）
-# 用法: pyinstaller label_APP.spec --noconfirm
+#
+# 用法:
+#     pyinstaller label_APP.spec --noconfirm
+#
+# 输出:
+#     dist/label_APP/label_APP.exe       单 exe,可双击启动
+#     dist/label_APP/_internal/           资源 / 依赖
+#
+# 启动后默认 console=False,浏览器自动打开 http://localhost:5000,
+# 直接进入 Pixiv 标注模式(不带 --quick);templates/ 必须打进去,
+# 否则 Web 端会 404。
+#
+# 重要 excludes:
+#     - torch / torchvision / torchaudio 不打进 exe(本应用无深度学习推理)
+#     - matplotlib / scipy / pandas / jupyter / pytest / tensorboard 同理
+#   这些库如果被打进,exe 体积会从 ~50MB 膨胀到 1GB+。
 
 import os
 import site

@@ -1,15 +1,22 @@
 """
-label.py - GraphColor 标注工具（前后端一体化）
+label.py - GraphColor 标注工具(前后端一体化)
+
+把"教师模型推理 + Web 标注 + 流式数据生产"打包成一条单一入口。
+后端是 Flask + graphcolor.GraphColorPipeline,前端是 templates/index.html
+的深色主题界面;通过两个队列把"下载/计算"和"标注"解耦,使得即便在网络
+或模型卡顿时,Web 端依然能稳定地一张一张地走完人工标注流程。
 
 四种运行模式:
-  1. 无参数                → Pixiv 流式标注（下载到 pixiv_temp/，结束清空）
-  2. --quick               → Pixiv 持久化标注（下载到 pixiv_img/，跳过时删除）
-  3. <图片路径>            → 本地图片标注（流式调用 graphcolor）
-  4. <results.json 路径>   → 本地 results 标注（直接用 results.json 数据）
+  1. 无参数                → Pixiv 流式标注(下载到 pixiv_temp/,结束清空)
+  2. --quick               → Pixiv 持久化标注(下载到 pixiv_img/,跳过时删除)
+  3. <图片路径>            → 本地图片标注(流式调用 graphcolor)
+  4. <results.json 路径>   → 本地 results 标注(直接用 results.json 数据)
 
-输出: targets_{TIME}.json
-断点: label_progress.json
-Web 端: http://localhost:5000
+输出:
+  targets_{TIME}.json      本次会话唯一的标签文件(增量写)
+  label_progress.json      断点文件,含 session_id / pool / queue / stats
+
+Web 端:  http://localhost:5000
 """
 import argparse
 import json
@@ -38,18 +45,20 @@ sys.path.insert(0, ROOT)
 from graphcolor import GraphColorPipeline  # noqa: E402
 
 # ─── 配置 ───────────────────────────────────────────────────────────────
+# 常量集中放这里,方便按需调整(线程数 / 缓冲大小 / 路径等)
 PIXIV_API = "https://api.lolicon.app/setu/v2"
-PIXIV_TEMP_DIR = os.path.join(ROOT, "pixiv_temp")
-PIXIV_IMG_DIR = os.path.join(ROOT, "pixiv_img")
-LOCAL_IMG_DIR = os.path.join(ROOT, "img")
+PIXIV_TEMP_DIR = os.path.join(ROOT, "pixiv_temp")    # 默认模式临时目录,退出清空
+PIXIV_IMG_DIR = os.path.join(ROOT, "pixiv_img")      # --quick 模式持久化目录
+LOCAL_IMG_DIR = os.path.join(ROOT, "img")            # 本地图片标注目录
 TEMPLATES_DIR = os.path.join(ROOT, "templates")
 BREAKPOINT_FILE = os.path.join(ROOT, "label_progress.json")
 
-DOWNLOAD_THREADS = 4
-POOL_TARGET = 3
-POOL_MAX = 5
-ANNOTATION_BUFFER = 5
-URL_BATCH = 10
+# 流式管线的并发 / 缓冲参数
+DOWNLOAD_THREADS = 4    # Pixiv 模式下的并发下载线程数
+POOL_TARGET = 3         # 下载池(已下载未计算)的目标大小
+POOL_MAX = 5            # 下载池上限(避免一次性拉太多)
+ANNOTATION_BUFFER = 5   # 已计算待标注的缓冲大小
+URL_BATCH = 10          # 每次从 lolicon 拉取的 URL 批大小
 
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif'}
 
@@ -832,7 +841,7 @@ class StreamingPipeline:
             if n_colors >= 3:
                 s3 = sorted_colors[2]["score"]
                 gap13 = (s1 - s3) / s1 if s1 > 0 else 0
-            if gap12 < 0.08 or (n_colors >= 3 and gap13 < 0.15):
+            if gap12 < 0.06 or (n_colors >= 3 and gap13 < 0.12):
                 return None, None, None, None
         lab = sorted_colors[0]["lab"]
         return float(lab[0]), float(lab[1]), float(lab[2]), confidence

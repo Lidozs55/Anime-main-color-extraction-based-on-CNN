@@ -1,5 +1,16 @@
 """
 结果图生成。
+
+提供两个独立函数,通常在 `python -m graphcolor.pipeline` 处理完图片后
+单独调用以生成报告插图:
+
+  - save_segmentation_visualization()
+      保存主体识别可视化图,同时把"首次 mask"和"精修后 mask"叠在同一张图上,
+      方便人工核对 refine 效果。
+
+  - save_result_preview()
+      在原图左下角叠加两个方形色块:前景主色、背景主色,
+      输出与 student/preview.py 完全一致的格式。
 """
 from pathlib import Path
 from typing import Optional, Union

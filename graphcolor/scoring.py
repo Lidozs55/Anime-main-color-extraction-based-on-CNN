@@ -43,7 +43,16 @@ DEFAULT_SKIN_SIGMA = np.array([16.0, 8.0, 10.0], dtype=np.float64)
 
 @dataclass
 class MainColor:
-    """单个主色结果"""
+    """单个主色结果(评分模块对外的统一输出)
+
+    Attributes:
+        lab:         (3,) 标准 Lab 值(L:0~100, a/b:-128~127)
+        rgb:         (3,) 0~255 的 RGB 值
+        hex_color:   "#RRGGBB" 形式的 hex 字符串
+        score:       综合评分(0~1),越大越像"主色"
+        proportion:  该聚类在所属区域中的像素占比(0~1)
+        cluster_id:  对应聚类编号
+    """
     lab: np.ndarray          # (3,) 标准Lab值
     rgb: np.ndarray          # (3,) RGB值 (0-255)
     hex_color: str           # "#RRGGBB"
@@ -54,7 +63,13 @@ class MainColor:
 
 @dataclass
 class RegionResult:
-    """单个区域（前景/背景）的主色分析结果"""
+    """单个区域(前景/背景)的主色分析结果
+
+    Attributes:
+        region_name:     "foreground" / "background"
+        main_colors:     按评分降序的主色列表(最多 5 条)
+        dominant_color:  最高分主色(== main_colors[0] 当列表非空时)
+    """
     region_name: str                    # "foreground" / "background"
     main_colors: List[MainColor]        # 按评分排序的主色列表
     dominant_color: MainColor           # 最高分主色
@@ -62,7 +77,16 @@ class RegionResult:
 
 @dataclass
 class ImageResult:
-    """单张图片的完整分析结果"""
+    """单张图片的完整分析结果
+
+    Attributes:
+        image_path:      原图路径
+        foreground:      前景区域分析结果
+        background:      背景区域分析结果
+        segment_method:  分割方法名("grabcut_seeded" / "neural_isnet-general-use" / ...)
+        seg_result:      原始 SegmentResult(用于 visualize,不参与 JSON 序列化)
+        skin_info:       {'fg': {...}, 'bg': {...}} 肤色惩罚快照,由 pipeline 填充
+    """
     image_path: str
     foreground: RegionResult
     background: RegionResult
@@ -74,8 +98,22 @@ class ImageResult:
 
 class ClusterScorer:
     """
-    聚类评分器。
-    每个聚类的主色被综合多个因子评分。
+    聚类评分器。每个聚类的主色被综合多个因子评分。
+
+    评分公式(对一个聚类):
+        1) 双线性项(bilinear):
+            combined = a·count + b·salience + c·count·salience
+           其中 a=weight_count_norm, b=weight_chroma_norm, c=weight_bilinear
+           c=0 时退化为纯加算;c>0 时"面积大且显著"的颜色获得额外加成,
+           "面积小但显著"的颜色被抑制(避免噪点上位)。
+        2) 线性项:
+            + weight_variance·variance  (亮度越均匀分越高)
+            + weight_center·center      (越靠近图像中心分越高)
+        3) 乘性折扣(可选,默认关闭):
+            × (1 - skin_similarity · skin_penalty_max)
+
+    输出按综合评分降序,过滤掉 score < min_score_display 的聚类,
+    最多保留前 5 个作为该区域的主色。
     """
 
     def __init__(self,
