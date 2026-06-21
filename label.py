@@ -327,7 +327,7 @@ class WebAnnotationServer:
                 if min_dist < 1.0 and closest is not None:
                     conf = closest.get("confidence", 1.0)
             with self.lock:
-                self.current_result = (L, a, b, conf)
+                self.current_result = (float(L), float(a), float(b), float(conf))
                 if self.current_event:
                     self.current_event.set()
             return jsonify({"ok": True})
@@ -448,6 +448,42 @@ class StreamingPipeline:
 
     # ── 启动 ────────────────────────────────────────────────────────
 
+    def _load_historical_targets(self):
+        """从最近一个 `targets_*.json` 加载历史标注到 self.targets。
+
+        设计目的:
+          --quick 模式下,图片持久化保留在 pixiv_img/ 中;
+          重启脚本会切换 session_id,默认流程下 self.targets 是空 dict,
+          导致 url_fetcher 重新抓取同一批 URL 重新下载/重新标注。
+        加载历史 targets 后,url_fetcher / download_worker 都会用 URL 作 key
+        过滤,实现"已标注图片零下载"。
+        """
+        pattern = os.path.join(ROOT, "targets_*.json")
+        files = sorted(glob(pattern), key=os.path.getmtime, reverse=True)
+        if not files:
+            return
+        loaded = 0
+        for f in files:
+            try:
+                with open(f, "r", encoding="utf-8") as fp:
+                    data = json.load(fp)
+            except (json.JSONDecodeError, OSError) as e:
+                print(f">>> 跳过损坏的 {os.path.basename(f)}: {e}")
+                continue
+            if not isinstance(data, dict):
+                continue
+            # 只把 URL 键(以 http 开头)合并进来;basename 键留给本地模式
+            for k, v in data.items():
+                if (isinstance(k, str) and k.startswith("http")
+                        and k not in self.targets):
+                    self.targets[k] = v
+                    loaded += 1
+            print(f">>> 加载历史标注: {os.path.basename(f)} "
+                  f"({loaded} 条 URL 键,文件总计 {len(data)} 条)")
+            return  # 只取最近一个文件
+        if not loaded and files:
+            print(">>> 历史 targets 加载为空,可能文件都是 basename 键")
+
     def start(self):
         cp = load_checkpoint()
         if cp:
@@ -469,9 +505,14 @@ class StreamingPipeline:
                 except OSError:
                     pass
                 self.targets = {}
+                # 跨会话恢复:从最近一个 targets_*.json 加载已标注的 URL
+                # (仅 quick 模式真正收益,其他模式也会拿到 URL 键并正常过滤)
+                self._load_historical_targets()
         else:
             print(f">>> 新会话 {self.session_id}")
             print(f">>> 输出文件: {os.path.basename(self.output_path)}")
+            # 跨会话恢复
+            self._load_historical_targets()
 
         # 准备目录
         if self.mode == "pixiv":
@@ -537,14 +578,34 @@ class StreamingPipeline:
     # ── Pixiv 阶段 1：URL 获取 ──────────────────────────────────────
 
     def _url_fetcher(self):
+        """从 lolicon 抓 URL,过滤掉 self.targets 里已标注的 + 同批重复的。"""
+        seen = set()
         buffer = []
         while not self.shutdown_event.is_set():
             if not buffer:
                 try:
-                    buffer = fetch_pixiv_urls(URL_BATCH)
+                    raw = fetch_pixiv_urls(URL_BATCH)
                 except Exception as e:
                     print(f"  [URL] 获取失败: {e}")
                     self.shutdown_event.wait(3)
+                    continue
+                # 三重过滤:无 URL / 已标注 / 批内重复
+                seen.clear()
+                buffer = []
+                for u in raw:
+                    url = u.get("url")
+                    if not url:
+                        continue
+                    with self.lock:
+                        if url in self.targets:
+                            continue
+                    if url in seen:
+                        continue
+                    seen.add(url)
+                    buffer.append(u)
+                if not buffer:
+                    # 本批全部是已标注的,稍等再拉
+                    self.shutdown_event.wait(2)
                     continue
             try:
                 self.url_queue.put(buffer.pop(0), timeout=1)
@@ -562,11 +623,25 @@ class StreamingPipeline:
                 info = self.url_queue.get(timeout=2)
             except queue.Empty:
                 continue
+            # 双检:URL 可能在 url_fetcher 放队后才被加入 self.targets
+            # (用户在 Web 端刚提交/跳过的图片)——此时直接丢弃,不再下载
+            with self.lock:
+                if info["url"] in self.targets:
+                    self.url_queue.task_done()
+                    continue
             try:
                 path = self._download_one(info)
                 if path:
                     info["local_path"] = path
                     info["local_name"] = os.path.basename(path)
+                    # 再次双检:下载期间用户可能在 Web 端完成了标注
+                    with self.lock:
+                        if info["url"] in self.targets:
+                            self.url_queue.task_done()
+                            # 文件已存在,保留(quick 模式)或删除
+                            if not self.quick:
+                                self._cleanup_file(info)
+                            continue
                     try:
                         self.pool.put(info, timeout=5)
                         with self.stats_lock:
@@ -579,11 +654,48 @@ class StreamingPipeline:
                 self.url_queue.task_done()
 
     def _download_one(self, info):
+        """下载单张 Pixiv 图片到本地。
+
+        文件命名: pixiv_{pid}_{page}{ext}
+          - ext  按 URL 末段(剥离 ?query)识别 .png/.jpg/.jpeg/.webp,
+                  兜底 .jpg(覆盖绝大多数 Pixiv 资源)
+          - 路径  quick 模式 → pixiv_img/ (永久保留)
+                  其他       → pixiv_temp/ (退出时清空)
+        复用策略:
+          - quick 模式且文件已存在且可读,直接复用,
+            避免重启后重新下载已标注图片。
+        """
         src_url = info["url"]
-        ext = ".png" if src_url.endswith(".png") else ".jpg"
+        # 1) 扩展名识别(剥离 query string 后判断)
+        url_path = src_url.split("?")[0].lower()
+        if url_path.endswith(".png"):
+            ext = ".png"
+        elif url_path.endswith((".jpg", ".jpeg")):
+            ext = ".jpg"
+        elif url_path.endswith(".webp"):
+            ext = ".webp"
+        else:
+            ext = ".jpg"  # 兜底:绝大多数 Pixiv 原图都是 jpg
+
         local_name = f"pixiv_{info['pid']}_{info['page']}{ext}"
         target_dir = PIXIV_IMG_DIR if self.quick else PIXIV_TEMP_DIR
         local_path = os.path.join(target_dir, local_name)
+
+        # 2) quick 模式:文件已存在且 verify 通过 → 直接复用,跳过下载
+        if self.quick and os.path.exists(local_path):
+            try:
+                img = Image.open(local_path)
+                img.verify()
+                img.close()
+                return local_path
+            except Exception:
+                # 文件损坏,删除后重新下载
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass
+
+        # 3) 正常下载
         req = urllib.request.Request(src_url, headers={
             "User-Agent": "Mozilla/5.0", "Referer": "https://www.pixiv.net/",
         })
@@ -759,9 +871,10 @@ class StreamingPipeline:
 
     def _annotate(self, result, info):
         img_name = info["local_name"]
-        fg_colors = [{"lab": list(c.lab), "score": c.score}
+        # 显式 float() 包裹 lab / score,杜绝 numpy 标量向下游渗漏
+        fg_colors = [{"lab": [float(x) for x in c.lab], "score": float(c.score)}
                      for c in result.foreground.main_colors]
-        bg_colors = [{"lab": list(c.lab), "score": c.score}
+        bg_colors = [{"lab": [float(x) for x in c.lab], "score": float(c.score)}
                      for c in result.background.main_colors]
 
         # 前景
@@ -790,13 +903,17 @@ class StreamingPipeline:
                 return
             L_bg, a_bg, b_bg, bg_conf = annot
 
-        # 保存结果
+        # 保存结果 —— 显式 float() 包裹,避免 numpy float32/64 进入 json.dump
         with self.lock:
             entry = {
-                "L_fg": round(L_fg, 1), "a_fg": round(a_fg, 1), "b_fg": round(b_fg, 1),
-                "fg_conf": round(fg_conf, 4),
-                "L_bg": round(L_bg, 1), "a_bg": round(a_bg, 1), "b_bg": round(b_bg, 1),
-                "bg_conf": round(bg_conf, 4),
+                "L_fg": round(float(L_fg), 1),
+                "a_fg": round(float(a_fg), 1),
+                "b_fg": round(float(b_fg), 1),
+                "fg_conf": round(float(fg_conf), 4),
+                "L_bg": round(float(L_bg), 1),
+                "a_bg": round(float(a_bg), 1),
+                "b_bg": round(float(b_bg), 1),
+                "bg_conf": round(float(bg_conf), 4),
             }
             if self.mode == "pixiv" and "url" in info:
                 entry["pixiv_id"] = info.get("pid")
@@ -844,7 +961,7 @@ class StreamingPipeline:
             if gap12 < 0.06 or (n_colors >= 3 and gap13 < 0.12):
                 return None, None, None, None
         lab = sorted_colors[0]["lab"]
-        return float(lab[0]), float(lab[1]), float(lab[2]), confidence
+        return float(lab[0]), float(lab[1]), float(lab[2]), float(confidence)
 
     def _calc_trigger_reason(self, colors):
         sorted_colors = sorted(colors, key=lambda c: c["score"], reverse=True)[:5]
@@ -874,10 +991,11 @@ class StreamingPipeline:
             s2 = sorted_colors[1]["score"] if len(sorted_colors) > 1 else s1
             conf = min(s1 / (2 * s2), 1.0) if s2 > 0 else 1.0
             candidates.append({
-                "lab": [round(L, 2), round(a, 2), round(b, 2)],
-                "score": round(c["score"], 4),
+                # 显式 float(),避免 numpy float32/64 渗到前端 JSON
+                "lab": [round(float(L), 2), round(float(a), 2), round(float(b), 2)],
+                "score": round(float(c["score"]), 4),
                 "hex": hex_color,
-                "confidence": round(conf, 4),
+                "confidence": round(float(conf), 4),
             })
         return {
             "img_info": info,
@@ -942,7 +1060,10 @@ class StreamingPipeline:
                 for item in pool_items:
                     self.pool.put(item)
             state["pool_items"] = pool_items
-            # 标注队列（取走后转 dict 保存，再放回）
+            # 标注队列(取走后转 dict 保存,再放回)
+            # 注意:必须把 c.lab / c.score 全部转成 Python 原生 float,
+            # 否则 list(c.lab) 内部仍是 np.float64,会让 json.dump 抛
+            # "Object of type float32 is not JSON serializable"。
             save_items = []
             requeue_items = []
             while not self.annotation_queue.empty():
@@ -951,13 +1072,19 @@ class StreamingPipeline:
                     result_dict = {
                         "foreground": {
                             "main_colors": [
-                                {"lab": list(c.lab), "score": float(c.score)}
+                                {
+                                    "lab": [float(x) for x in c.lab],
+                                    "score": float(c.score),
+                                }
                                 for c in result.foreground.main_colors
                             ]
                         },
                         "background": {
                             "main_colors": [
-                                {"lab": list(c.lab), "score": float(c.score)}
+                                {
+                                    "lab": [float(x) for x in c.lab],
+                                    "score": float(c.score),
+                                }
                                 for c in result.background.main_colors
                             ]
                         },

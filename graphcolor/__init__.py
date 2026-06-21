@@ -15,6 +15,7 @@ graphcolor - 教师模型（基于图论/Lab 空间的主色提取算法包）
                 函数与 MainColor / RegionResult / ImageResult 数据类
   visualize       —— 将分割结果 / 主色色块保存为 PNG
   html_visualize  —— 把一批结果流式生成静态 HTML 报告
+  shadow          —— 纯经典 Lab 空间阴影去除(无神经网络,主色提取前调用)
 
 典型用法:
     from graphcolor import GraphColorPipeline
@@ -28,6 +29,7 @@ from .preprocess import load_and_resize
 from .segment import ForegroundSegmenter, NeuralSegmenter
 from .cluster import LabClusterer
 from .scoring import ClusterScorer
+from .shadow import ShadowRemover
 from .visualize import save_result_preview, save_segmentation_visualization
 
 __version__ = "0.1.0"

@@ -54,14 +54,23 @@ def deltaE_ab(lab1, lab2):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="在 val 集上评估 ColorNet-Masked 学生模型")
+    parser.add_argument('--no-shadow-removal', action='store_true',
+                        help='关闭阴影去除(必须与训练/推理一致,否则指标无意义)')
+    args = parser.parse_args()
+    use_shadow_removal = not args.no_shadow_removal
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = ColorNetMasked().to(device)
     model.load_state_dict(torch.load('best_model.pth', map_location=device))
     model.eval()
+    print(f"阴影去除: {'关闭' if not use_shadow_removal else '开启'}")
 
     target_jsons = find_all_targets()
     img_dir = DEFAULT_IMG_DIR
-    val_set = ColorDataset(img_dir, target_jsons, 'val', pixiv_download_dir=DEFAULT_PIXIV_DIR)
+    val_set = ColorDataset(img_dir, target_jsons, 'val',
+                           pixiv_download_dir=DEFAULT_PIXIV_DIR,
+                           use_shadow_removal=use_shadow_removal)
     loader = DataLoader(val_set, batch_size=64, shuffle=False)
 
     if len(val_set) == 0:

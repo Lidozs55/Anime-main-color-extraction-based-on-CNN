@@ -59,13 +59,17 @@ def main():
     parser.add_argument('--batch-size', type=int, default=64, help='batch size（默认 64）')
     parser.add_argument('--patience', type=int, default=15, help='early stopping patience（默认 15）')
     parser.add_argument('--lr', type=float, default=1e-3, help='学习率（默认 1e-3）')
+    parser.add_argument('--no-shadow-removal', action='store_true',
+                        help='关闭阴影去除(默认开启,与 preview.py 推理时一致)')
     args = parser.parse_args()
 
     total_episodes = args.episodes
     patience = args.patience
+    use_shadow_removal = not args.no_shadow_removal
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"使用设备: {device}")
+    print(f"阴影去除: {'关闭' if not use_shadow_removal else '开启'}")
 
     # 查找所有 targets JSON 文件
     target_jsons = find_all_targets()
@@ -78,8 +82,10 @@ def main():
         print(f"  - {tj}")
 
     img_dir = DEFAULT_IMG_DIR
-    train_set = ColorDataset(img_dir, target_jsons, 'train', pixiv_download_dir=DEFAULT_PIXIV_DIR)
-    val_set = ColorDataset(img_dir, target_jsons, 'val', pixiv_download_dir=DEFAULT_PIXIV_DIR)
+    train_set = ColorDataset(img_dir, target_jsons, 'train', pixiv_download_dir=DEFAULT_PIXIV_DIR,
+                             use_shadow_removal=use_shadow_removal)
+    val_set = ColorDataset(img_dir, target_jsons, 'val', pixiv_download_dir=DEFAULT_PIXIV_DIR,
+                           use_shadow_removal=use_shadow_removal)
 
     print(f"\n训练集: {len(train_set)} 张")
     print(f"验证集: {len(val_set)} 张")

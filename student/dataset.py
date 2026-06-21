@@ -7,17 +7,30 @@
   - split                'train' / 'val'  (前 80% 训练,后 20% 验证,按字典序)
   - img_size             训练 / 评估时的方形边长
   - pixiv_download_dir   Pixiv 图片目录,首次遇到 Pixiv URL 时按需下载
+  - use_shadow_removal   是否在 __getitem__ 中应用阴影去除
+                         (默认 True,与 student/preview.py 推理时保持一致;
+                          否则会出现 train/inference domain shift)
+
+数据流:
+  读图 → [阴影去除] → RandomHorizontalFlip/Rotation/Crop(训练) → Resize(验证)
+        → ToTensor → (3, H, W) float32 in [0, 1]
 
 输出 (__getitem__):
   img_t    (3, H, W) float32 in [0, 1]
   lab_fg   (3,) 前景点 Lab (L, a, b)
   lab_bg   (3,) 背景点 Lab (L, a, b)
 """
-import os, json, re
+import os, json, re, sys
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
 import torchvision.transforms as T
+import numpy as np
+import cv2
+
+# 引入 graphcolor.shadow(在父目录)
+sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
+from graphcolor.shadow import ShadowRemover
 
 # 下载 Pixiv 图片用的工具
 import urllib.request
@@ -27,7 +40,8 @@ IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
 
 
 class ColorDataset(Dataset):
-    def __init__(self, img_dir, target_jsons, split='train', img_size=128, pixiv_download_dir=None):
+    def __init__(self, img_dir, target_jsons, split='train', img_size=128,
+                 pixiv_download_dir=None, use_shadow_removal=True):
         """
         Args:
             img_dir: 本地图片根目录
@@ -35,9 +49,15 @@ class ColorDataset(Dataset):
             split: 'train' 或 'val'
             img_size: 图片缩放尺寸
             pixiv_download_dir: Pixiv 图片下载目录（默认: 项目根的 pixiv_img/）
+            use_shadow_removal: 是否应用阴影去除(必须与 student/preview.py 一致,
+                                避免 train/inference 输入分布不一致)
         """
         self.img_dir = img_dir
         self.img_size = img_size
+        self.use_shadow_removal = use_shadow_removal
+        # ShadowRemover 实例 — PyTorch DataLoader 多 worker 时,每个 worker 持有自己的实例
+        # (通过 worker_init_fn 重建;简单起见,这里 lazy init,__getitem__ 中检查)
+        self._shadow_remover = None
         if pixiv_download_dir is None:
             # 项目根的 pixiv_img/ 目录（与 img_dir 同级或在根级）
             # 优先取 img_dir 上一级（即项目根），再向下找 pixiv_img
@@ -157,9 +177,23 @@ class ColorDataset(Dataset):
     def __len__(self):
         return len(self.paths)
 
+    def _get_shadow_remover(self):
+        """Lazy 创建 ShadowRemover;每个 worker 进程第一次调用时构造自己的实例。"""
+        if self._shadow_remover is None:
+            self._shadow_remover = ShadowRemover(enabled=True)
+        return self._shadow_remover
+
     def __getitem__(self, idx):
         path = self.paths[idx]
         img = Image.open(path).convert('RGB')
+
+        # 阴影去除(必须在 transform 之前,保留原始空间结构给随机裁剪)
+        # 与 student/preview.py 推理时一致,避免 train/inference domain shift
+        if self.use_shadow_removal:
+            bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            bgr = self._get_shadow_remover().remove(bgr)
+            img = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+
         img_t = self.transform(img)
         tgt = self.targets[path]
         return img_t, torch.tensor([tgt['L_fg'], tgt['a_fg'], tgt['b_fg']]), torch.tensor([tgt['L_bg'], tgt['a_bg'], tgt['b_bg']])

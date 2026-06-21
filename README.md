@@ -6,9 +6,11 @@
 
 GraphColor + CNN 是一个面向**插画 / 动漫 / 设计稿**的「主色提取 + 模型蒸馏」一体化工具集，核心目标是自动得到一张图片的**前景主色**与**背景主色**（Lab 空间），并把整套"慢但准"的图论算法蒸馏到一个 ~3MB 的轻量 CNN 里，方便在本地或嵌入式环境毫秒级复用。
 
-- **教师模型 `graphcolor/`**：基于 Lab 色彩空间 + Mini-Batch K-Means 聚类 + 综合感知评分的主色提取管线。`pipeline → preprocess → segment → cluster → scoring` 全流程可在 `python -m graphcolor.pipeline` 单文件 / 多文件 / 通配符调用，并支持 `--workers` 多进程并行；`html_visualize` 可将一批结果一键生成静态 HTML 报告。
-- **学生模型 `student/`**：`ColorNet-Masked` 是一套轻量 CNN（MBConv 主干 + 软掩膜 + 双 FC 头），输入 128×128 RGB，输出 fg / bg 的 Lab 三元组与显著性掩膜。提供 `train.py`（支持 cosine LR + early stopping + 断点续训）、`eval.py`（dE*ab）、`export.py`（TorchScript）、`preview.py`（批量出对比图）四个 CLI 入口。
-- **标注工具 `label.py`**：把教师模型与 Web 标注界面组装成一条**流式数据生产线**。支持 **Pixiv 流式 / Pixiv 持久化 / 本地图片 / 本地 results** 四种入口；教师置信度高时自动通过，低时弹出深色主题 Web 端让你从候选色块 / 调色盘 / hex 输入中确认或跳过；`label_progress.json` 负责断点续标，`targets_{TIME}.json` 记录最终标签，按 Ctrl+C 或点"退出系统"都会触发完整落盘。
+项目把过去分散在两个旧子项目中的能力合并到同一仓库：
+
+- **教师模型 `graphcolor/`**：基于 Lab 色彩空间 + Mini-Batch K-Means 聚类 + 综合感知评分 + **阴影去除**（纯经典 Lab 空间方法）的主色提取管线。`pipeline → preprocess → segment → cluster → scoring → shadow` 全流程可在 `python -m graphcolor.pipeline` 单文件 / 多文件 / 通配符调用，并支持 `--workers` 多进程并行；`html_visualize` 可将一批结果一键生成静态 HTML 报告。**阴影去除**通过大 σ 高斯估计"应有亮度"图，在 `L_illum - L > 阈值` 的区域按比例补偿 L 通道，削弱阴影对 chroma 主体识别 + K-Means 聚类的干扰；零模型文件、CPU 单张 ~40ms。
+- **学生模型 `student/`**：`ColorNet-Masked` 是一套轻量 CNN（MBConv 主干 + 软掩膜 + 双 FC 头），输入 128×128 RGB，输出 fg / bg 的 Lab 三元组与显著性掩膜。提供 `train.py`（支持 cosine LR + early stopping + 断点续训）、`eval.py`（dE*ab）、`export.py`（TorchScript）、`preview.py`（批量出对比图）四个 CLI 入口。**训练 / 推理 / 评估三处的阴影去除同步开启**（默认通过 `--no-shadow-removal` 可关），保证 train/inference 输入分布完全一致,student 模型可独立完成主色提取。
+- **标注工具 `label.py`**：把教师模型与 Web 标注界面组装成一条**流式数据生产线**。支持 **Pixiv 流式 / Pixiv 持久化 / 本地图片 / 本地 results** 四种入口；教师置信度高时自动通过，低时弹出深色主题 Web 端让你从候选色块 / 调色盘 / hex 输入中确认或跳过；`label_progress.json` 负责断点续标，`targets_{TIME}.json` 记录最终标签，按 Ctrl+C 或点"退出系统"都会触发完整落盘；新会话启动时**自动从最近一个 `targets_*.json` 跨会话恢复已标注 URL**,quick 模式下实现已标注图片零下载。
 - **单 exe 打包**：`label_APP.spec` 配合 PyInstaller 把整套标注工具打成 `dist/label_APP/label_APP.exe`，内置 `templates/`，双击即开浏览器开始 Pixiv 标注，**完全无需 Python 环境**——这让普通用户也能参与打标，从而源源不断地产出 CNN 训练数据。
 
 典型工作流是：用 `label.py --quick` 拉取 Pixiv 图片并打标（同时把图片沉淀到 `pixiv_img/` 作为训练样本），积累到一定规模后 `cd student && python train.py` 蒸馏出学生模型，之后即可在任意机器上以 `python preview.py` 毫秒级预测任意图片的 fg / bg 主色，省去反复启动深度学习教师模型的开销。

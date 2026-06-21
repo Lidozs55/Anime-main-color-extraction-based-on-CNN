@@ -1,9 +1,17 @@
 """
-将训练好的模型预测结果输出为与 graphcolor 完全一致的预览图：
+将训练好的模型预测结果输出为与 graphcolor 完全一致的预览图:
 主图 + 左下角前景/背景两个主色色块。
 
+数据流:
+  读图 → [阴影去除] → 128x128 resize → student 模型 → Lab → BGR 色块叠加 → 保存
+
+阴影去除(默认开启):
+  student/dataset.py 在训练时同步应用,所以推理时也必须应用,
+  否则会出现 train/inference 之间的 domain shift
+  (教师给的是去阴影后的 Lab,student 训练时看到原图 → 推理时却是去阴影后图)。
+
 用法:
-    python preview.py [--model best_model.pth] [--output-dir ../outputs/model_previews] [--img-dir ../extracted_imgs/imgs]
+    python preview.py [--model best_model.pth] [--output-dir ../outputs/model_previews] [--img-dir ../extracted_imgs/imgs] [--no-shadow-removal]
 """
 import sys, os, glob, argparse, time
 import torch
@@ -12,8 +20,11 @@ import cv2
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 引入 graphcolor.shadow(在父目录)
+sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
 
 from model import ColorNetMasked
+from graphcolor.shadow import ShadowRemover
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -77,16 +88,24 @@ def main():
     parser.add_argument('--model', default=None, help='模型权重路径（默认: student/best_model.pth）')
     parser.add_argument('--output-dir', default=None, help='输出目录（默认: ../outputs/model_previews）')
     parser.add_argument('--img-dir', default=None, help='本地图片目录（默认: ../img）')
-    parser.add_argument('--pixiv-dir', default=None, help='Pixiv 图片目录（默认: ../pixiv_img）')
+    parser.add_argument('--no-shadow-removal', action='store_true',
+                        help='关闭阴影去除(默认开启,与 dataset.py 训练时一致)')
+    parser.add_argument('--shadow-sigma-ratio', type=float, default=None,
+                        help='覆盖 ShadowRemover 的 sigma_ratio(默认 0.125)')
     args = parser.parse_args()
 
     project_root = os.path.normpath(os.path.join(SCRIPT_DIR, '..'))
     model_path = args.model or os.path.join(SCRIPT_DIR, 'best_model.pth')
     output_dir = args.output_dir or os.path.join(project_root, 'outputs', 'model_previews')
     img_dir = args.img_dir or os.path.join(project_root, 'img')
-    pixiv_dir = args.pixiv_dir or os.path.join(project_root, 'pixiv_img')
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # 阴影去除器(必须与 student/dataset.py 训练时一致)
+    shadow_kwargs = {"enabled": not args.no_shadow_removal}
+    if args.shadow_sigma_ratio is not None:
+        shadow_kwargs["sigma_ratio"] = args.shadow_sigma_ratio
+    shadow_remover = ShadowRemover(**shadow_kwargs)
 
     # 加载模型
     model = ColorNetMasked().to(device)
@@ -97,22 +116,24 @@ def main():
         model.load_state_dict(ckpt)
     model.eval()
 
-    # 收集图片：本地 + pixiv
-    all_paths = collect_images(img_dir, pixiv_dir)
+    # 收集图片:仅处理 imgs 目录
+    all_paths = collect_images(img_dir)
     if not all_paths:
-        print(f"错误: 在 {img_dir} 与 {pixiv_dir} 中未找到任何图片")
+        print(f"错误: 在 {img_dir} 中未找到任何图片")
         sys.exit(1)
 
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"设备: {device}")
     print(f"模型: {model_path}")
+    print(f"阴影去除: {'关闭' if args.no_shadow_removal else '开启'}")
     print(f"待处理: {len(all_paths)} 张图片")
     print(f"输出目录: {output_dir}")
 
     total_start = time.time()
     success_count = 0
     skip_count = 0
+    elapsed_list = []
 
     with torch.no_grad():
         for i, path in enumerate(all_paths):
@@ -124,6 +145,9 @@ def main():
                 continue
 
             t0 = time.time()
+
+            # 阴影去除(必须与训练时一致,否则 student 看到不同分布)
+            img = shadow_remover.remove(img)
 
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             img_pil = Image.fromarray(img_rgb)
@@ -142,6 +166,7 @@ def main():
             cv2.imwrite(out_path, out_img)
 
             elapsed = time.time() - t0
+            elapsed_list.append(elapsed)
             print(f"  [{i+1}/{len(all_paths)}] OK  {name}  {elapsed*1000:.0f}ms  "
                   f"FG=({fg_lab[0]:.0f},{fg_lab[1]:.0f},{fg_lab[2]:.0f})  "
                   f"BG=({bg_lab[0]:.0f},{bg_lab[1]:.0f},{bg_lab[2]:.0f})")
@@ -149,13 +174,14 @@ def main():
 
     total_elapsed = time.time() - total_start
     avg_per_image = total_elapsed / success_count if success_count > 0 else 0
+    median_per_image = float(np.median(elapsed_list)) if elapsed_list else 0.0
 
     print(f"\n完成！")
     print(f"  成功: {success_count} 张  跳过: {skip_count} 张")
     print(f"  总耗时: {total_elapsed:.2f}s")
     print(f"  平均每张: {avg_per_image*1000:.0f}ms")
+    print(f"  中位数每张: {median_per_image*1000:.0f}ms")
     print(f"  预览图已保存至: {output_dir}")
-
 
 if __name__ == '__main__':
     main()

@@ -26,11 +26,16 @@ from .cluster import LabClusterer, ClusterResult
 from .scoring import (
     ClusterScorer, MainColor, RegionResult, ImageResult, analyze_region
 )
+from .shadow import ShadowRemover
 
 
 DEFAULT_CONFIG = {
     # 预处理
     "max_size": 512,
+    # 阴影去除(纯经典 Lab 空间方法,默认开启;教师标注前自动调用)
+    #   - False: 关闭(保持原图)
+    #   - True(默认): 用 ShadowRemover 默认参数处理
+    "use_shadow_removal": True,
     # 分割（3个核心参数，控制主体识别的激进程度）
     "chroma_threshold": 12.0,       # 色度阈值：越低→识别越激进，更多彩色区域被纳入主体
     "min_contour_area_ratio": 0.02,  # 最小轮廓面积比：越低→保留更小的轮廓细节
@@ -51,8 +56,8 @@ DEFAULT_CONFIG = {
     "weight_count": 0.5,
     "weight_variance": 0.08,
     "weight_center": 0.08,
-    "weight_chroma": 0.14,
-    "weight_bilinear": 0.2,           # count*salience 双线性项 (0=退化为加算)
+    "weight_chroma": 0.2,
+    "weight_bilinear": 0.14,           # count*salience 双线性项 (0=退化为加算)
     "min_score_display": 0.05,
     # 视觉显著性参数
     "salience_a_weight": 1.2,          # 色度计算中 a* 的加权: chroma=sqrt(a_weight*a²+b²)
@@ -74,6 +79,12 @@ class GraphColorPipeline:
 
     def __init__(self, config: Optional[dict] = None):
         self.config = {**DEFAULT_CONFIG, **(config or {})}
+
+        # 阴影去除器(经典 Lab 空间,纯 numpy/opencv,无模型)
+        # 教师管线在 load_and_resize 后自动调用 self.shadow_remover.remove()
+        self.shadow_remover = ShadowRemover(
+            **self.config.get("shadow_removal_params", {})
+        )
 
         # 分割器选择：默认使用 NeuralSegmenter（深度学习），
         # 可通过 config["use_grabcut"] = True 切换回传统 GrabCut 方案
@@ -151,9 +162,18 @@ class GraphColorPipeline:
         """
         path = Path(image_path)
 
-        # 步骤1: 加载 & 缩放
+        # 步骤1: 加载 & 缩放(必须先 resize,再去阴影 ——
+        #       否则大图上的 Gaussian blur 会慢到无法接受;
+        #       去阴影的检测本来就只需要低频信息,小图上做完全够用)
         original_bgr, alpha = load_image(str(path))
         bgr = resize_to_max(original_bgr, self.config["max_size"])
+
+        # 步骤1.5: 阴影去除(默认开启;经典 Lab 空间方法)
+        #   目的: 削弱阴影对 chroma-based 主体识别 + K-Means 聚类的干扰
+        #   在 resize 之后做,512×512 上单张 ~40ms,大图 8s+ 的瓶颈消失
+        if self.config.get("use_shadow_removal", True):
+            bgr = self.shadow_remover.remove(bgr)
+
         alpha_small = None
         if alpha is not None:
             alpha_small = resize_to_max(alpha, self.config["max_size"], cv2.INTER_AREA)
