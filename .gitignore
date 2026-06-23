@@ -18,6 +18,8 @@ label_progress_*.json.bak
 # ───── CNN 训练产物（student/）─────
 *.pth
 *.pt
+# 例外：best_model 是发布版本，需入库
+!student/best_model.pth
 *.onnx
 outputs/
 student/.shadow_cache/
