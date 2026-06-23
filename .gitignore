@@ -20,6 +20,7 @@ label_progress_*.json.bak
 *.pt
 *.onnx
 outputs/
+student/.shadow_cache/
 
 # ───── PyInstaller 打包产物─────
 build/

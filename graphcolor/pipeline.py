@@ -34,8 +34,31 @@ DEFAULT_CONFIG = {
     "max_size": 512,
     # 阴影去除(纯经典 Lab 空间方法,默认开启;教师标注前自动调用)
     #   - False: 关闭(保持原图)
-    #   - True(默认): 用 ShadowRemover 默认参数处理
+    #   - True(默认): 以下 shadow_removal_params 作为参数
     "use_shadow_removal": True,
+    "shadow_removal_params": {
+        # 光照估计
+        "sigma_ratio": 0.10,             # 高斯 σ 与图片短边的比值
+        # 检测阈值
+        "shadow_threshold": 3.0,         # L_illum - L > 该值才视为阴影(3.0 激进,捕获浅阴影)
+        "dark_object_ratio": 0.20,       # L > ratio * L_illum 才视为潜在阴影
+                                         # (0.20 防线: 黑发 0.11<0.20→排除,阴影 0.44>0.20→保留)
+        # 形态学
+        "use_morphology": True,
+        "morph_kernel_size": 5,          # 小核(5x5 椭圆),避免 mask 过度外扩
+        # 目标 L 公式
+        "target_l_offset": 0.08,         # 加性偏移
+        "target_l_gain": 1.2,            # 乘性增益
+        # 色差约束连通块
+        "color_threshold": 15.0,         # BGR max 通道差阈值
+        # 阴影区线性混合比例
+        "shadow_blend": 0.5,             # 0=不改, 0.5=半细节保留, 1=完全填 target_L
+        # ab 补偿
+        "ab_compensation_alpha": 0.3,    # 0=关闭,0.3 轻度,0.5 中度,1.0 满补偿
+        # ab 比例一致性(逐连通块,替代 per-pixel a_illum/b_illum)
+        "ab_consistency_threshold": 20.0, # 逐连通块: 组件 vs 膨胀环的比例模型比对
+                                          # 误差 < 该值才算阴影
+    },
     # 分割（3个核心参数，控制主体识别的激进程度）
     "chroma_threshold": 12.0,       # 色度阈值：越低→识别越激进，更多彩色区域被纳入主体
     "min_contour_area_ratio": 0.02,  # 最小轮廓面积比：越低→保留更小的轮廓细节

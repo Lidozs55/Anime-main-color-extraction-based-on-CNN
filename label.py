@@ -55,15 +55,31 @@ BREAKPOINT_FILE = os.path.join(ROOT, "label_progress.json")
 
 # 流式管线的并发 / 缓冲参数
 DOWNLOAD_THREADS = 4    # Pixiv 模式下的并发下载线程数
-POOL_TARGET = 3         # 下载池(已下载未计算)的目标大小
-POOL_MAX = 5            # 下载池上限(避免一次性拉太多)
-ANNOTATION_BUFFER = 5   # 已计算待标注的缓冲大小
+POOL_TARGET = 5         # 下载池(已下载未计算)的目标大小
+POOL_MAX = 10            # 下载池上限(避免一次性拉太多)
+ANNOTATION_BUFFER = 10   # 已计算待标注的缓冲大小
 URL_BATCH = 10          # 每次从 lolicon 拉取的 URL 批大小
 
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif'}
 
+# ─── 自动标注阈值(供动态策略替换) ───────────────────────────────────────
+GAP_THRESHOLDS = {
+    "gap12_trigger": 0.05,  # s1-s2 gap < 此值 → 触发人工标注(ΔE 保护可覆盖)
+    "gap13_trigger": 0.1,  # s1-s3 gap < 此值 → 触发人工
+    "delta_e_merge": 5.0,   # Lab 色差 < 此值视为人眼不可区分
+    "top_k":         8,      # 候选色最大保留数
+    "confidence_cap_ratio": 1.5,  # s1 / (ratio * s2) 截断到 [0,1] 的分母系数
+}
+
 
 # ─── 工具函数 ───────────────────────────────────────────────────────────
+
+def lab_delta_e(lab1, lab2):
+    """CIE76 ΔE 色差: sqrt((L1-L2)^2 + (a1-a2)^2 + (b1-b2)^2)。"""
+    return ((lab1[0] - lab2[0])**2
+            + (lab1[1] - lab2[1])**2
+            + (lab1[2] - lab2[2])**2) ** 0.5
+
 
 def lab_to_rgb(L, a, b):
     """Lab 转 RGB（用于前端色块显示）。"""
@@ -115,6 +131,65 @@ def hex_to_lab(hex_color):
     a = 500.0 * (fx - fy)
     b_lab = 200.0 * (fy - fz)
     return (L, a, b_lab)
+
+
+def _topk_by_score(colors, k):
+    """按 score 降序取前 k 个。k <= 0 或 colors 为空返回空列表。"""
+    if not colors:
+        return []
+    k = min(k, len(colors))
+    return sorted(colors, key=lambda c: c["score"], reverse=True)[:k]
+
+
+def _gap(s1, s2):
+    """相邻候选色的归一化差值 gap = (s1 - s2) / s1,s1<=0 时返回 0。"""
+    return (s1 - s2) / s1 if s1 > 0 else 0.0
+
+
+def _confidence_from_scores(scores, ratio):
+    """s1 / (ratio * s2) 截断到 [0,1];无 s2 时返回 1.0。"""
+    if len(scores) < 2 or scores[1] <= 0:
+        return 1.0
+    return min(scores[0] / (ratio * scores[1]), 1.0)
+
+
+def _is_human_indistinguishable(top_colors, delta_e_thr):
+    """顶部两个候选色的 Lab 色差是否小于阈值(人眼不可区分)。
+
+    top_colors 必须是按 score 降序的列表,至少 2 个元素。
+    """
+    return lab_delta_e(top_colors[0]["lab"], top_colors[1]["lab"]) < delta_e_thr
+
+
+def _should_auto(top_colors, thr):
+    """根据 gap12 / gap13 + ΔE 保护判断是否可以直接取第 1 名做自动标注。
+
+    返回 (decision, reason):
+      decision = True   → 可自动标注
+      decision = False  → 需要走人工标注
+      reason          → 触发人工标注的诊断字符串(空表示无触发原因)
+    """
+    if len(top_colors) < 2:
+        return True, ""
+
+    s1, s2 = top_colors[0]["score"], top_colors[1]["score"]
+    gap12 = _gap(s1, s2)
+    gap13 = _gap(s1, top_colors[2]["score"]) if len(top_colors) >= 3 else 0.0
+
+    gap12_small = gap12 < thr["gap12_trigger"]
+    gap13_small = len(top_colors) >= 3 and gap13 < thr["gap13_trigger"]
+
+    if not (gap12_small or gap13_small):
+        return True, ""
+
+    # ΔE 保护:两色人眼分不出 → 直接取第 1 名
+    if _is_human_indistinguishable(top_colors, thr["delta_e_merge"]):
+        return True, ""
+
+    # 生成原因字符串:gap12 与 gap13 单独触发分别说明
+    if gap12_small:
+        return False, f"gap12={gap12:.3f}<{thr['gap12_trigger']:.2f}"
+    return False, f"gap13={gap13:.3f}<{thr['gap13_trigger']:.2f}"
 
 
 def expand_paths(patterns, extract_dir=None):
@@ -225,34 +300,6 @@ def merge_to_final(targets, output_path):
         json.dump(targets, f, indent=2, ensure_ascii=False)
 
 
-def migrate_confidence(path):
-    """迁移旧版 targets 文件中的置信度。"""
-    if not os.path.exists(path):
-        print(f"未找到 {path}")
-        return
-    with open(path, 'r', encoding='utf-8') as f:
-        targets = json.load(f)
-    fixed_human = 0
-    fixed_convert = 0
-    for _key, entry in targets.items():
-        if not isinstance(entry, dict):
-            continue
-        for k in ['fg_conf', 'bg_conf']:
-            if k not in entry:
-                continue
-            old = entry[k]
-            if old < 0.52:
-                entry[k] = 1.0
-                fixed_human += 1
-            elif old < 0.999:
-                new_conf = old / (2 * (1 - old))
-                entry[k] = round(min(new_conf, 1.0), 4)
-                fixed_convert += 1
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(targets, f, indent=2, ensure_ascii=False)
-    print(f"已迁移 {len(targets)} 条数据: {fixed_human} 条人类标注→1.0, {fixed_convert} 条公式转换: {path}")
-
-
 # ─── Web 标注服务器 ──────────────────────────────────────────────────────
 
 class WebAnnotationServer:
@@ -312,20 +359,20 @@ class WebAnnotationServer:
                     return jsonify({"ok": False, "error": "没有待标注任务"}), 400
                 task = self.current_task
             L, a, b = hex_to_lab(hex_color)
-            candidates = task["candidates"]
+            # 人类标注路径:conf = 1.0(主色一定正确,供 CNN 训练)
+            # gap 公式 s1/(ratio*s2) 仅在自动标注(_auto_annotate)里使用
             conf = 1.0
+            candidates = task["candidates"]
             if candidates:
-                # 检查是否与某个算法候选匹配，匹配则使用其置信度
-                min_dist = float('inf')
-                closest = None
-                for c in candidates:
-                    d = ((L - c["lab"][0])**2 + (a - c["lab"][1])**2
-                         + (b - c["lab"][2])**2) ** 0.5
-                    if d < min_dist:
-                        min_dist = d
-                        closest = c
-                if min_dist < 1.0 and closest is not None:
-                    conf = closest.get("confidence", 1.0)
+                # 累加教师模型错误:前端返回值与 top1 的 hex 不同就 +1
+                top1_hex = candidates[0].get("hex", "")
+                if hex_color.lower() != top1_hex.lower():
+                    with self.pipeline.teacher_errors_lock:
+                        self.pipeline.teacher_errors += 1
+                        total = self.pipeline.teacher_errors
+                    print(f"  [教师模型错误] {task['img_info']['local_name']} "
+                          f"{task['region_type']}: 选了{hex_color}, "
+                          f"top1={top1_hex} → 累计={total}")
             with self.lock:
                 self.current_result = (float(L), float(a), float(b), float(conf))
                 if self.current_event:
@@ -407,6 +454,10 @@ class StreamingPipeline:
         self.stats = {"downloaded": 0, "computed": 0, "annotated": 0, "skipped": 0}
         self.stats_lock = threading.Lock()
 
+        # 教师模型错误计数:用户走人工标注且最终选择 ≠ top1 时累加
+        self.teacher_errors = 0
+        self.teacher_errors_lock = threading.Lock()
+
         self.session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
         self.output_path = os.path.join(ROOT, f"targets_{self.session_id}.json")
 
@@ -430,8 +481,8 @@ class StreamingPipeline:
         if self.mode == "pixiv":
             return PIXIV_IMG_DIR if self.quick else PIXIV_TEMP_DIR
         if self.mode == "local_image":
-            # 优先使用 img/，否则用源路径所在的目录
-            return LOCAL_IMG_DIR
+            # 优先使用 _local_root（由 _preload_local_images 根据实际路径设置）
+            return getattr(self, '_local_root', LOCAL_IMG_DIR)
         if self.mode == "local_results":
             # 本地 results 模式假设图片已在 img/
             return LOCAL_IMG_DIR
@@ -534,9 +585,13 @@ class StreamingPipeline:
                                  name=f"dl-{i}").start()
             threading.Thread(target=self._compute_worker, daemon=True, name="compute").start()
         elif self.mode == "local_image":
-            self._preload_local_images()
+            # 本地图片模式: 后台线程预加载,避免阻塞 Flask 服务器
+            # 也在后台启动,处理完毕后线程自然退出
+            threading.Thread(target=self._preload_local_images, daemon=True,
+                             name="local-preload").start()
         elif self.mode == "local_results":
-            self._preload_local_results()
+            threading.Thread(target=self._preload_local_results, daemon=True,
+                             name="local-results").start()
 
     def _restore_pixiv_pools(self, cp):
         """从断点恢复下载池与标注队列（仅 pixiv 模式）。"""
@@ -737,27 +792,32 @@ class StreamingPipeline:
             print(f"错误: 未找到任何图片，请检查路径 {self.source}")
             self.shutdown_event.set()
             return
+        # 设置 web_root 为图片所在目录（取第一张图片的目录作为基准）
+        self._local_root = os.path.dirname(os.path.abspath(paths[0]))
         pending = [p for p in paths if os.path.basename(p) not in self.targets]
         print(f"找到 {len(paths)} 张图片（{len(pending)} 张待标注）")
         if not pending:
             print("全部已标注，下次启动会直接退出。")
             return
-        for path in pending:
+        for i, path in enumerate(pending):
             if self.shutdown_event.is_set():
                 break
             try:
+                name = os.path.basename(path)
+                print(f"  [{i+1}/{len(pending)}] {name} ... ", end="", flush=True)
                 result = self.graphcolor.process(path)
                 info = {
                     "local_path": path,
-                    "local_name": os.path.basename(path),
-                    "key": os.path.basename(path),
+                    "local_name": name,
+                    "key": name,
                     "source": "local",
                 }
                 self.annotation_queue.put((result, info), timeout=600)
                 with self.stats_lock:
                     self.stats["computed"] += 1
+                print(f"OK")
             except Exception as e:
-                print(f"  [计算] {os.path.basename(path)}: {e}")
+                print(f"  [{i+1}/{len(pending)}] {os.path.basename(path)}: {e}")
 
     # ── 本地 results 模式：预加载 ────────────────────────────────────
 
@@ -941,43 +1001,26 @@ class StreamingPipeline:
         self._post_annotate_cleanup(info)
 
     def _auto_annotate(self, colors):
-        n_colors = min(len(colors), 5)
-        if n_colors == 0:
+        """根据候选色分数自动给出 Lab 标注 + 置信度;无法判定返回 (None,...)。"""
+        top = _topk_by_score(colors, GAP_THRESHOLDS["top_k"])
+        if not top:
             return 50.0, 0.0, 0.0, 1.0
-        sorted_colors = sorted(colors, key=lambda c: c["score"], reverse=True)[:n_colors]
-        if n_colors >= 2:
-            s1, s2 = sorted_colors[0]["score"], sorted_colors[1]["score"]
-            confidence = min(s1 / (2 * s2), 1.0) if s2 > 0 else 1.0
-        else:
-            confidence = 1.0
-        if n_colors >= 2:
-            s1 = sorted_colors[0]["score"]
-            s2 = sorted_colors[1]["score"]
-            gap12 = (s1 - s2) / s1 if s1 > 0 else 0
-            gap13 = 0
-            if n_colors >= 3:
-                s3 = sorted_colors[2]["score"]
-                gap13 = (s1 - s3) / s1 if s1 > 0 else 0
-            if gap12 < 0.06 or (n_colors >= 3 and gap13 < 0.12):
-                return None, None, None, None
-        lab = sorted_colors[0]["lab"]
+
+        scores = [c["score"] for c in top]
+        confidence = _confidence_from_scores(scores, GAP_THRESHOLDS["confidence_cap_ratio"])
+
+        can_auto, _reason = _should_auto(top, GAP_THRESHOLDS)
+        if not can_auto:
+            return None, None, None, None
+
+        lab = top[0]["lab"]
         return float(lab[0]), float(lab[1]), float(lab[2]), float(confidence)
 
     def _calc_trigger_reason(self, colors):
-        sorted_colors = sorted(colors, key=lambda c: c["score"], reverse=True)[:5]
-        n = len(sorted_colors)
-        if n < 2:
-            return ""
-        s1, s2 = sorted_colors[0]["score"], sorted_colors[1]["score"]
-        gap12 = (s1 - s2) / s1 if s1 > 0 else 0
-        if gap12 < 0.08:
-            return f"gap12={gap12:.3f}<0.08"
-        if n >= 3:
-            s3 = sorted_colors[2]["score"]
-            gap13 = (s1 - s3) / s1 if s1 > 0 else 0
-            if gap13 < 0.15:
-                return f"gap13={gap13:.3f}<0.15"
-        return ""
+        """生成"为何需要人工标注"的诊断字符串;不需标注则返回 ""。"""
+        top = _topk_by_score(colors, GAP_THRESHOLDS["top_k"])
+        can_auto, reason = _should_auto(top, GAP_THRESHOLDS)
+        return "" if can_auto else reason
 
     def _make_web_task(self, colors, info, region_type, trigger_reason):
         sorted_colors = sorted(colors, key=lambda c: c["score"], reverse=True)[:5]
@@ -1120,6 +1163,15 @@ def detect_mode(source, quick):
     if quick:
         print("错误: --quick 仅在无参数 Pixiv 模式下生效")
         return "error_quick_conflict"
+
+    # 展开通配符，支持 img/*.jpg 等写法
+    wildcards = {'*', '?', '['}
+    if any(c in source for c in wildcards):
+        matched = glob(source)
+        if matched:
+            return "local_image"
+        return "error_path_not_found"
+
     if not os.path.exists(source):
         return "error_path_not_found"
     if source.lower().endswith(".json"):
@@ -1151,20 +1203,13 @@ def main():
   python label.py --quick                           # Pixiv 持久化
   python label.py img/*.png                         # 本地图片
   python label.py outputs/results.json              # 本地 results
-  python label.py --migrate targets.json            # 迁移旧版置信度
         """)
     parser.add_argument('source', nargs='?', default=None,
                         help='本地图片路径（文件/目录/通配符/zip）或 results.json 路径；省略则走 Pixiv 流水线')
     parser.add_argument('--quick', action='store_true',
                         help='Pixiv 持久化模式（仅与无参数 Pixiv 模式搭配）')
     parser.add_argument('--port', type=int, default=5000, help='Web 服务器端口（默认 5000）')
-    parser.add_argument('--migrate', type=str, metavar='FILE',
-                        help='迁移旧版 targets 文件置信度')
     args = parser.parse_args()
-
-    if args.migrate:
-        migrate_confidence(args.migrate)
-        return
 
     mode = detect_mode(args.source, args.quick)
     if mode == "error_quick_conflict" or mode == "error_path_not_found":

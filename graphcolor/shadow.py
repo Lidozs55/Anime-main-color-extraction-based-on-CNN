@@ -1,8 +1,7 @@
 """
-阴影去除模块 — 经典 Lab 空间方法(v3.6,色差约束连通块 目标L + 线性混合 + ab 补偿,无羽化,**无高光**)。
+阴影去除模块 — 经典 Lab 空间方法(色差约束连通块 + 目标L + 线性混合 + ab 补偿,无羽化,无高光)。
 
 集成位置
-─────────
   - 教师管线:  graphcolor/pipeline.GraphColorPipeline.process()
                load_and_resize 之后、segment 之前调用
   - 学生推理:  student/preview.py, cv2.imread 之后立即调用
@@ -10,47 +9,16 @@
                (避免 train/inference 的 domain shift)
 
 处理流水线
-──────────
-  shadow 修正(单步)
   BGR→Lab → 检测 mask → 形态学清理 → 色差约束连通块 → 逐块目标L → 线性混合 → 硬掩码 → ab 补偿
 
-为什么无羽化
-────────────
-  羽化在阴影/非阴影交界处产生"灰边"伪影;本模块采用硬掩码,
-  边缘过渡由下游"目标L"思路处理(职责分离)。
-
-版本说明
-────────
-  v3.6: target_L 改为基于"色差约束连通块"的逐块计算:
-        mask 内像素按 RGB 色差约束(相邻像素 BGR max diff < color_threshold)
-        划分为连通块, 每块独立计算 median L, 再套用 target_L 公式。
-        解决 v3.5 两大问题:
-          1) L_illum(高斯模糊)让周围亮像素渗透进阴影区, 产生扰动;
-          2) 浅/深阴影边界的平滑过渡问题(高斯模糊天然平滑, 丢失边缘)。
-        新方案: 色差约束保证连通块不会跨越颜色/亮度边缘,
-                浅阴影和深阴影即使空间相邻, 只要色差够大就分属不同块,
-                每块独立计算 target_L, 不会互相干扰。
-  v3.5: target_L 改为 per-pixel 公式: target_L[px] = 0.05*255 + 1.2 * L_illum[px]
-        (已废弃: L_illum 高斯模糊导致亮像素扰动 + 边缘平滑过渡)
-  v3.4: 完全移除高光处理(函数/参数/CLI/测试全删);
-        加入下限保护 L_new = max(L, L_blend),修复"亮边变暗"伪影
-  v3.3: 阴影 L 改用线性混合(原图与目标L的线性组合,blend=0.5 默认),避免纯色块
-  v3.2: 移除羽化;阴影 L 改用目标L公式(整个阴影区映射到同一 target_L 标量)
-  v3.1: 引入 ab 补偿(补偿 L 改变带来的感知饱和度变化)
-  v3:   简单乘性 boost_factor(已废弃,被 v3.2 目标L 取代)
-
-优点
-────
-  - 零模型文件、零下载、零额外依赖
-  - CPU 512×512 单张 <30ms(ab 补偿,无羽化无高光,向量化逐块 mean)
-  - 不改变 a*/b* 方向(hue),只改 magnitude
-  - 边缘过渡不在本模块职责范围
-
-局限
-────
-  - 软阴影/自阴影检测能力有限
-  - 极暗场景(L_illum < 25)不强行补偿
-  - 不处理高光(若需要可下游单独实现)
+设计要点
+  - 无羽化: 羽化在阴影/非阴影交界处产生"灰边"伪影;边缘过渡由下游"目标L"思路处理(职责分离)。
+  - 色差约束连通块: mask 内像素按 RGB 色差约束(相邻像素 BGR max diff < color_threshold)
+    划分为连通块,每块独立计算 median L,再套用 target_L 公式。
+    保证浅阴影和深阴影即使空间相邻,只要色差够大就分属不同块,不会互相干扰。
+  - 零模型文件、零下载、零额外依赖。
+  - 不改变 a*/b* 方向(hue),只改 magnitude。
+  - 软阴影/自阴影检测能力有限;极暗场景(L_illum < 25)不强行补偿;不处理高光。
 """
 from typing import Optional
 import cv2
@@ -63,119 +31,190 @@ import numpy as np
 def _color_constrained_labeling(shadow_mask: np.ndarray,
                                  bgr: np.ndarray,
                                  color_threshold: float) -> tuple:
-    """在 shadow_mask 内按 RGB 色差约束做连通域标记(Union-Find, O(N α(N)))。
+    """在 shadow_mask 内按 RGB 色差约束做连通域标记(光栅扫描 + 等效标签合并)。
 
-    两个相邻阴影像素属于同一连通块, 当且仅当它们的 BGR max 通道差
-    小于 color_threshold。使用 Union-Find + 向量化边缘检测,
-    内联 find/union 消除 Python 函数调用开销, 用 flat index 避免
-    y*w+x 坐标转换。
+    策略: 逐行光栅扫描,水平连通(左邻色差 < 阈值)继承同标签;垂直连通(上邻色差 < 阈值)
+    记录标签等价关系;最后用打平后的等效标签表做 vectorized 赋值。
+    避免 per-edge Union-Find 的 Python while 循环瓶颈。
 
-    Args:
-        shadow_mask: bool 数组 (H, W), 阴影 mask
-        bgr: uint8 BGR 图像 (H, W, 3)
-        color_threshold: BGR max 通道差阈值 (默认 15)
-
-    Returns:
-        labels: int32 数组 (H, W), 0 表示非阴影, 1..n_labels 表示连通块编号
-        n_labels: 连通块数量
+    两个相邻阴影像素属于同一连通块,当且仅当它们的 BGR max 通道差
+    小于 color_threshold。
     """
     h, w = shadow_mask.shape
-    n = h * w
 
-    # ── Union-Find ──
-    _p = np.arange(n, dtype=np.int32)
-    _r = np.zeros(n, dtype=np.int32)
+    if not shadow_mask.any():
+        return np.zeros((h, w), dtype=np.int32), 0
 
-    # ── 向量化计算相邻像素 BGR max 通道差 (int16 替代 float32, 紧凑数组) ──
-    color_threshold_f = float(color_threshold)
     bgr_i = bgr.astype(np.int16)
+    ct = float(color_threshold)
 
-    # 水平边: (y, x) 与 (y, x-1) 的色差 → (h, w-1) 紧凑数组
-    h_diff = np.max(np.abs(bgr_i[:, 1:] - bgr_i[:, :-1]), axis=2)
-    h_edge = (shadow_mask[:, 1:] & shadow_mask[:, :-1] &
-              (h_diff < color_threshold_f))
-    h_edge_flat = np.flatnonzero(h_edge)
-    if len(h_edge_flat) > 0:
-        y_h = h_edge_flat // (w - 1)
-        x_h = h_edge_flat % (w - 1)
-        h_idx = (y_h * w + (x_h + 1)).astype(np.int32)
-    else:
-        h_idx = np.array([], dtype=np.int32)
+    # Precompute 色差(向量化)
+    h_diff = np.max(np.abs(bgr_i[:, 1:] - bgr_i[:, :-1]), axis=2)   # (h, w-1)
+    v_diff = np.max(np.abs(bgr_i[1:, :] - bgr_i[:-1, :]), axis=2)  # (h-1, w)
 
-    # 垂直边: (y, x) 与 (y-1, x) 的色差 → (h-1, w) 紧凑数组
-    v_diff = np.max(np.abs(bgr_i[1:, :] - bgr_i[:-1, :]), axis=2)
-    v_edge = (shadow_mask[1:, :] & shadow_mask[:-1, :] &
-              (v_diff < color_threshold_f))
-    v_edge_flat = np.flatnonzero(v_edge)
-    if len(v_edge_flat) > 0:
-        y_v = v_edge_flat // w
-        x_v = v_edge_flat % w
-        v_idx = ((y_v + 1) * w + x_v).astype(np.int32)
-    else:
-        v_idx = np.array([], dtype=np.int32)
+    # Union-Find (仅对标签 ID,非像素)
+    parent: dict[int, int] = {}
 
-    # ── Union 所有满足色差约束的边 (内联 find+union, list 迭代减少 numpy 装箱开销) ──
-    # 水平边: union(idx, idx-1) 其中 idx = y*w + x (右像素)
-    for idx in h_idx.tolist():
-        i = idx
-        while _p[i] != i:
-            _p[i] = _p[_p[i]]
-            i = _p[i]
-        j = idx - 1
-        while _p[j] != j:
-            _p[j] = _p[_p[j]]
-            j = _p[j]
-        if i != j:
-            if _r[i] < _r[j]:
-                _p[i] = j
-            elif _r[i] > _r[j]:
-                _p[j] = i
-            else:
-                _p[j] = i
-                _r[i] += 1
+    def _find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
 
-    # 垂直边: union(idx, idx-w) 其中 idx = y*w + x (下像素)
-    for idx in v_idx.tolist():
-        i = idx
-        while _p[i] != i:
-            _p[i] = _p[_p[i]]
-            i = _p[i]
-        j = idx - w
-        while _p[j] != j:
-            _p[j] = _p[_p[j]]
-            j = _p[j]
-        if i != j:
-            if _r[i] < _r[j]:
-                _p[i] = j
-            elif _r[i] > _r[j]:
-                _p[j] = i
-            else:
-                _p[j] = i
-                _r[i] += 1
+    def _union(x: int, y: int) -> None:
+        rx, ry = _find(x), _find(y)
+        if rx != ry:
+            parent[rx] = ry
 
-    # ── 分配 label (向量化: path 压缩 + np.unique + np.searchsorted) ──
+    # Pass 1: 光栅扫描分配临时标签
     labels = np.zeros((h, w), dtype=np.int32)
-    shadow_flat = np.flatnonzero(shadow_mask)
-    if len(shadow_flat) == 0:
+    next_label = 0
+    _prev_row_labels = np.zeros(w, dtype=np.int32)  # 缓存上一行标签,避免 labels[y-1] 索引开销
+
+    for y in range(h):
+        row_mask = shadow_mask[y]
+        _this_row = labels[y]
+
+        for x in range(w):
+            if not row_mask[x]:
+                continue
+
+            left_ok = (x > 0 and row_mask[x-1] and h_diff[y, x-1] < ct)
+            up_ok = (y > 0 and shadow_mask[y-1, x] and v_diff[y-1, x] < ct)
+
+            if left_ok:
+                label = _this_row[x-1]
+                if up_ok:
+                    other = _prev_row_labels[x]
+                    if label != other:
+                        _union(label, other)
+                _this_row[x] = label
+            elif up_ok:
+                _this_row[x] = _prev_row_labels[x]
+            else:
+                next_label += 1
+                _this_row[x] = next_label
+                parent[next_label] = next_label
+
+        _prev_row_labels = _this_row
+
+    if next_label == 0:
         return labels, 0
 
-    # 仅对阴影像素做 path 压缩 (避免全图 262k 次 Python 循环)
-    for idx in shadow_flat.tolist():
-        while _p[idx] != _p[_p[idx]]:
-            _p[idx] = _p[_p[idx]]
+    # Pass 2: 打平所有标签的根
+    max_label = next_label
+    all_roots = np.arange(max_label + 1, dtype=np.int32)
+    for lab in range(1, max_label + 1):
+        all_roots[lab] = _find(lab)
 
-    # 向量化: 取根 → 唯一根 → searchsorted 映射到连续 label
-    roots = _p[shadow_flat]
-    unique_roots = np.unique(roots)
+    # Pass 3: 连续编号 1..n_labels
+    unique_roots = np.unique(all_roots[1:])
+    root_to_new = np.zeros(max_label + 1, dtype=np.int32)
+    for i, r in enumerate(unique_roots):
+        root_to_new[r] = i + 1
     n_labels = len(unique_roots)
-    labels.ravel()[shadow_flat] = np.searchsorted(unique_roots, roots) + 1
 
-    return labels, n_labels
+    # Pass 4: Vectorized 赋值
+    shadow_idx = np.flatnonzero(shadow_mask)
+    final = root_to_new[all_roots[labels.ravel()[shadow_idx]]]
+    out = np.zeros((h, w), dtype=np.int32)
+    out.ravel()[shadow_idx] = final
+    return out, n_labels
 
 
 # ──────────────────────────────────────────────────────────────────────
 # 阴影去除:目标 L + 线性混合 + ab 补偿,无羽化
 # ──────────────────────────────────────────────────────────────────────
+
+def _filter_components_by_ab_consistency(labels, n_labels, lab, L, shadow_mask,
+                                          ab_consistency_threshold=20.0):
+    """逐连通块 ab 比例一致性检查,排除异色物体误判为阴影。
+
+    对每个连通块:
+      1. 膨胀 mask(5x5 椭圆,3 次)取外环
+      2. 组件均值 Lab 与环均值 Lab
+      3. 预测 ab = ring_ab × (comp_L / ring_L), 偏差 > threshold → 排除
+
+    优化策略:
+      - 用 np.bincount 一次性计算所有组件的均值(免去逐个 mask 的 O(N) 扫描)
+      - 对满足大小门槛的组件,用边界框约束缩小 dilation 区域(避免在 512x512 上逐个 dilate)
+
+    核心假设: 真实阴影的 ab 随 L 同比例缩小,异色物体则不然。
+    """
+    if n_labels == 0 or ab_consistency_threshold <= 0:
+        return shadow_mask, False
+
+    H, W = labels.shape
+    a_signed = lab[..., 1] - 128.0
+    b_signed = lab[..., 2] - 128.0
+
+    # ── 向量化: 一次性计算所有组件的像素数和均值 ──
+    flat = labels.ravel()
+    flat_L = L.ravel()
+    flat_a = a_signed.ravel()
+    flat_b = b_signed.ravel()
+
+    cnt = np.bincount(flat, minlength=n_labels + 1)          # (n_labels+1,)
+    sum_L = np.bincount(flat, weights=flat_L, minlength=n_labels + 1)
+    sum_a = np.bincount(flat, weights=flat_a, minlength=n_labels + 1)
+    sum_b = np.bincount(flat, weights=flat_b, minlength=n_labels + 1)
+    # cnt[0] = 非阴影(忽略)
+    mean_L = np.zeros(n_labels + 1, dtype=np.float64)
+    mean_a = np.zeros(n_labels + 1, dtype=np.float64)
+    mean_b = np.zeros(n_labels + 1, dtype=np.float64)
+    ok = cnt > 0
+    mean_L[ok] = sum_L[ok] / cnt[ok]
+    mean_a[ok] = sum_a[ok] / cnt[ok]
+    mean_b[ok] = sum_b[ok] / cnt[ok]
+
+    # ── 筛选出需检查的标签(>=9 像素) ──
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    rejected = []
+    # 跳过 label 0(非阴影)
+    check_labels = np.flatnonzero(cnt[1:] >= 9) + 1
+
+    for label_id in check_labels:
+        # 边界框约束: 只取组件所在区域 + 6px padding(3 次 dilation 最大膨胀量)
+        ys, xs = np.where(labels == label_id)
+        y1 = max(0, int(ys.min()) - 8)
+        y2 = min(H, int(ys.max()) + 9)
+        x1 = max(0, int(xs.min()) - 8)
+        x2 = min(W, int(xs.max()) + 9)
+
+        sub = labels[y1:y2, x1:x2]
+        sub_mask = (sub == label_id).astype(np.uint8)
+
+        expanded = cv2.dilate(sub_mask, kernel, iterations=3).astype(bool)
+        ring = expanded & (sub != label_id)
+        n_ring = ring.sum()
+        if n_ring < 16:
+            continue
+
+        # 环的均值
+        ring_L = L[y1:y2, x1:x2][ring].mean()
+        ring_a = a_signed[y1:y2, x1:x2][ring].mean()
+        ring_b = b_signed[y1:y2, x1:x2][ring].mean()
+
+        comp_L = mean_L[label_id]
+        comp_a = mean_a[label_id]
+        comp_b = mean_b[label_id]
+
+        L_ratio = comp_L / max(ring_L, 1e-6)
+        ab_error = (abs(comp_a - ring_a * L_ratio)
+                    + abs(comp_b - ring_b * L_ratio))
+
+        if ab_error > ab_consistency_threshold:
+            rejected.append(label_id)
+
+    if not rejected:
+        return shadow_mask, False
+
+    new_mask = shadow_mask.copy()
+    for lid in rejected:
+        new_mask &= (labels != lid)
+    return new_mask, True
+
+
 def _remove_shadow_lab(bgr: np.ndarray,
                        sigma: int,
                        threshold: float,
@@ -183,41 +222,41 @@ def _remove_shadow_lab(bgr: np.ndarray,
                        ab_compensation_alpha: float = 0.3,
                        use_morphology: bool = True,
                        morph_kernel_size: int = 3,
-                       target_l_offset: float = 0.1,
-                       target_l_gain: float = 1.25,
+                       target_l_offset: float = 0.08,
+                       target_l_gain: float = 1.2,
                        shadow_blend: float = 0.5,
-                       color_threshold: float = 15.0) -> np.ndarray:
+                       color_threshold: float = 15.0,
+                       ab_consistency_threshold: float = 25.0,
+                       fast_mode: bool = False) -> np.ndarray:
     """Lab 空间阴影去除(目标 L + 线性混合 + ab 补偿,纯 numpy + opencv,无羽化)。
 
     算法步骤
-    --------
       1) BGR → Lab
       2) 大 σ 高斯估计光照分量 L_illum(只用于检测)
       3) 多条件阴影检测(diff + 周围够亮 + 非暗物体)
       4) 形态学清理(OPEN 去噪 + 1 次 DILATE 轻膨胀填洞)
-      5) 色差约束连通块: mask 内按 BGR max 通道差 < color_threshold 做连通域标记
-      6) 逐块目标 L: 每块独立计算 median L, target_L[block] = offset×255 + gain×median_L
-         (解决 v3.5 L_illum 高斯模糊的两大问题: 亮像素扰动 + 边缘平滑过渡)
-      7) 线性混合 + 下限保护(逐像素, 保留原始细节):
-           L_blend[px] = (1 - blend) × L[px] + blend × target_L[px]
-           L_new[px] = max(L[px], L_blend[px])
-      8) 硬掩码 L 修正(np.where 直接切换,无羽化)
-      9) ab 补偿(逐像素 per_pixel_boost = L_new/L,按 ^α 缩放 a/b,掩码外不动)
+      5) [标准模式] 色差约束连通块: mask 内按 BGR max 通道差 < color_threshold 做连通域标记
+      6) [标准模式] 逐组件 ab 一致性检查: 排除异色物体误判
+      7) [标准/快速] 目标 L: 标准模式按块独立计算,快速模式全局统一计算
+      8) [标准/快速] 线性混合 + 下限保护
+      9) [标准/快速] 硬掩码 L 修正
+      10) [标准/快速] ab 补偿
 
     Args:
         bgr: 输入 BGR uint8 图
-        sigma: 高斯 σ(光照估计用,通常由 sigma_ratio × 短边 得到)
-        threshold: L_illum − L > 该值才视为阴影(默认 3.0,激进以捕获浅阴影)
-        dark_object_ratio: 暗物体过滤比例(L > ratio * L_illum 才视为潜在阴影,
-                          默认 0.20 放宽,允许浅阴影;真实阴影 80/180=0.44 保留,黑头发 20/180=0.11 排除)
-        ab_compensation_alpha: ab 补偿强度(0=关闭,0.3 轻度,0.5 中度,1.0 满补偿)
+        sigma: 高斯 σ(光照估计用)
+        threshold: L_illum − L > 该值才视为阴影(默认 3.0)
+        dark_object_ratio: 暗物体过滤比例
+        ab_compensation_alpha: ab 补偿强度(0=关闭)
         use_morphology: 是否对 mask 做开运算+轻膨胀
-        morph_kernel_size: 形态学核大小(默认 3,3×3 椭圆核避免 mask 过度外扩)
-        target_l_offset: 目标 L 公式的加性偏移(0-1 空间,默认 0.1)
-        target_l_gain: 目标 L 公式的乘性增益(默认 1.25)
-        shadow_blend: 阴影区线性混合比例(0=不改,0.5=半细节保留,1=完全填 target_L;默认 0.5)
-        color_threshold: 色差约束连通块的 BGR max 通道差阈值(默认 15,
-                         相邻阴影像素 BGR max|diff| < 该值才归入同一连通块)
+        morph_kernel_size: 形态学核大小
+        target_l_offset: 目标 L 的加性偏移(0-1 空间)
+        target_l_gain: 目标 L 的乘性增益
+        shadow_blend: 阴影区线性混合比例
+        color_threshold: 色差约束连通块阈值(标准模式)
+        ab_consistency_threshold: 逐组件 ab 一致性阈值(标准模式)
+        fast_mode: 若为 True,跳过连通块标记和 ab 一致性检查,全局计算目标 L,
+                  速度更快但精度略降(适用于对速度敏感的推理场景,如 preview.py)
 
     Returns:
         与输入同形状、同 dtype 的 BGR uint8 图像。
@@ -231,18 +270,17 @@ def _remove_shadow_lab(bgr: np.ndarray,
     L = lab[..., 0]
 
     # 2) 大 σ 高斯估计光照分量 (降采样加速: 2x 缩小 → 小核模糊 → 2x 放大)
-    #    L_illum 只用于阴影检测 (L_illum - L > threshold), 降采样引入的
-    #    微小误差被阈值 margin 吸收, 对最终结果无实质影响。
+    #    L_illum 只用于阴影检测,降采样引入的微小误差被阈值 margin 吸收。
     h_small, w_small = max(16, H // 2), max(16, W // 2)
     L_small = cv2.resize(L, (w_small, h_small))
     L_illum_small = cv2.GaussianBlur(L_small, (0, 0),
                                      sigmaX=sigma / 2.0, sigmaY=sigma / 2.0)
     L_illum = cv2.resize(L_illum_small, (W, H))
 
-    # 3) 多条件阴影 mask
-    #    a) L 显著低于 L_illum(阈值 3.0,激进一些以捕获浅阴影)
-    #    b) 周围不能太暗(L_illum > 25,允许偏暗图的浅阴影)
-    #    c) L > ratio * L_illum(关键:过滤黑物体,保留真实阴影;0.20 放宽)
+    # 3) 多条件阴影 mask:
+    #    a) L 显著低于 L_illum(阈值 3.0,激进以捕获浅阴影)
+    #    b) 周围不能太暗(L_illum > 15,允许偏暗图的浅阴影)
+    #    c) L > ratio * L_illum(过滤黑物体,保留真实阴影;0.20 放宽)
     cond_diff = (L_illum - L) > threshold
     cond_illum = L_illum > 15.0
     cond_not_dark = L > dark_object_ratio * L_illum
@@ -251,66 +289,98 @@ def _remove_shadow_lab(bgr: np.ndarray,
     if not shadow_mask.any():
         return bgr
 
-    # 4) 形态学清理(去小斑 + 轻膨胀填洞)
-    #    OPEN 去噪(用 3×3 核,保守)
-    #    DILATE(1次)代替 CLOSE:把 mask 边缘向外推 ~1 像素,既填小洞又不过度外扩
-    #    (原 CLOSE 用 5×5 核会把 mask 扩展 2-3 像素,过激)
+    # 4) 形态学清理: OPEN 去噪 + DILATE(1次)轻膨胀填洞
+    #    (用 3×3 核保守,避免 CLOSE 把 mask 扩展 2-3 像素)
     if use_morphology:
-        k = max(3, int(morph_kernel_size) | 1)
+        # Fast mode 强制更保守的核(3×3,不开 1 次 DILATE 之外的额外扩张),
+        # 防止快速模式因跳过 ab 一致性检查而把暗物体误判为阴影
+        if fast_mode:
+            k = 3
+        else:
+            k = max(3, int(morph_kernel_size) | 1)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
         mask_u8 = cv2.morphologyEx(
             (shadow_mask.astype(np.uint8) * 255),
             cv2.MORPH_OPEN, kernel,
         )
-        mask_u8 = cv2.dilate(mask_u8, kernel, iterations=1)
+        if not fast_mode:
+            # 标准模式: 1 次 DILATE 轻膨胀填洞
+            mask_u8 = cv2.dilate(mask_u8, kernel, iterations=1)
         shadow_mask = mask_u8 > 127
         if not shadow_mask.any():
             return bgr
 
-    # 5) 色差约束连通块: mask 内按 RGB 色差约束做连通域标记
-    #    相邻像素 BGR max 通道差 < color_threshold 才归入同一连通块
-    #    这确保浅阴影和深阴影即使空间相邻也不会被合并到同一块
-    labels, n_labels = _color_constrained_labeling(shadow_mask, bgr, color_threshold)
+    if fast_mode:
+        # ── 快速模式: 跳过连通块标记和 ab 一致性检查 ──
+        # 修复参数 (target_l_offset / target_l_gain / shadow_blend / ab_compensation_alpha)
+        # **与标准模式完全一致**,只调整**检测段**使其更保守:
+        #   - threshold 2.0(比标准 3.0 更小)→ 真实阴影 L_illum−L > 2 即可
+        #   - dark_object_ratio 0.35(比标准 0.20 更严)→ 排除更多暗物体
+        #   - cond_illum 18.0(比标准 15.0 略严)→ 周围更亮才允许检测
+        # 目的: 抵消跳过 ab 一致性检查带来的"把暗物体当阴影"风险
+        det_threshold = min(threshold, 2.0)
+        det_dark_ratio = max(dark_object_ratio, 0.35)
+        det_min_illum = 18.0
 
-    # 6) 逐块目标 L: 每块独立计算 mean L, 套用 target_L 公式
-    #    target_L[block] = offset×255 + gain×mean_L[block]
-    #    解决 v3.5 L_illum 两大问题:
-    #      a) 周围亮像素通过高斯模糊渗透进阴影区 → 扰动 target_L
-    #      b) 高斯模糊平滑掉边缘 → 浅/深阴影边界过渡平滑而非明显边缘
-    #    优化: 用 np.bincount 向量化逐块均值替代 sort+groupby+for 循环
-    #    色差约束连通块内像素颜色相近, 均值 ≈ 中位数, 可放心使用
-    target_L_arr = np.zeros_like(L)
-    if n_labels > 0:
-        shadow_flat_labels = labels[shadow_mask]
-        shadow_flat_L = L[shadow_mask]
-        sum_per_label = np.bincount(shadow_flat_labels, weights=shadow_flat_L,
-                                    minlength=n_labels + 2)[1:]
-        cnt_per_label = np.bincount(shadow_flat_labels,
-                                    minlength=n_labels + 2)[1:]
-        mean_per_label = sum_per_label / np.maximum(cnt_per_label, 1)
-        flat_target = (target_l_offset * 255.0
-                       + target_l_gain * mean_per_label[shadow_flat_labels - 1])
-        shadow_indices = np.flatnonzero(shadow_mask)
-        target_L_arr.ravel()[shadow_indices] = flat_target
-    target_L_arr = np.clip(target_L_arr, 0.0, 255.0)
+        cond_diff = (L_illum - L) > det_threshold
+        cond_illum = L_illum > det_min_illum
+        cond_not_dark = L > det_dark_ratio * L_illum
+        det_mask = cond_diff & cond_illum & cond_not_dark
+        if not det_mask.any():
+            return bgr
+        # 用更保守的检测结果替换原 shadow_mask
+        shadow_mask = det_mask
 
-    # 7) 线性混合(逐像素,保留原始细节,避免纯色块)
-    #    L_blend[px] = (1 - blend) × L[px] + blend × target_L[px]
+        # 直接取阴影 mask 的全局均值作为目标 L,统一应用于整个 shadow mask
+        target_L_arr = np.zeros_like(L)
+        shadow_mean_L = L[shadow_mask].mean()
+        target_val = target_l_offset * 255.0 + target_l_gain * shadow_mean_L
+        target_L_arr[shadow_mask] = target_val
+        target_L_arr = np.clip(target_L_arr, 0.0, 255.0)
+    else:
+        # 5) 色差约束连通块: 相邻像素 BGR max 通道差 < color_threshold 才归入同一连通块
+        #    确保浅阴影和深阴影即使空间相邻也不会被合并到同一块
+        labels, n_labels = _color_constrained_labeling(shadow_mask, bgr, color_threshold)
+
+        # 6) 逐组件 ab 一致性检查: 组件级 O(N) 检查,不引入额外高斯模糊,
+        #    跨颜色边界阴影不受影响(每种颜色半区形成独立组件)
+        if n_labels > 0:
+            shadow_mask, _ = _filter_components_by_ab_consistency(
+                labels, n_labels, lab, L, shadow_mask, ab_consistency_threshold,
+            )
+            if not shadow_mask.any():
+                return bgr
+            labels, n_labels = _color_constrained_labeling(shadow_mask, bgr, color_threshold)
+
+        # 7) 逐块目标 L: 每块独立计算 mean L,套用 target_L 公式
+        #    用 np.bincount 向量化逐块均值替代 sort+groupby+for 循环
+        #    (色差约束连通块内像素颜色相近,均值 ≈ 中位数)
+        target_L_arr = np.zeros_like(L)
+        if n_labels > 0:
+            shadow_flat_labels = labels[shadow_mask]
+            shadow_flat_L = L[shadow_mask]
+            sum_per_label = np.bincount(shadow_flat_labels, weights=shadow_flat_L,
+                                        minlength=n_labels + 2)[1:]
+            cnt_per_label = np.bincount(shadow_flat_labels,
+                                        minlength=n_labels + 2)[1:]
+            mean_per_label = sum_per_label / np.maximum(cnt_per_label, 1)
+            flat_target = (target_l_offset * 255.0
+                           + target_l_gain * mean_per_label[shadow_flat_labels - 1])
+            shadow_indices = np.flatnonzero(shadow_mask)
+            target_L_arr.ravel()[shadow_indices] = flat_target
+        target_L_arr = np.clip(target_L_arr, 0.0, 255.0)
+
+    # 8) 线性混合 + 下限保护(修复"亮边变暗"伪影):
+    #    若原 L > target_L,L_blend < L,max 保护让该像素保持原 L
     L_blend = (1.0 - shadow_blend) * L + shadow_blend * target_L_arr
-
-    # 7.5) 下限保护(修复"亮边变暗"伪影):
-    #      若原 L > target_L(target_L < L), L_blend < L,
-    #      max 保护让该像素保持原 L,避免把已够亮的边界点反向压低
     L_new = np.maximum(L, L_blend)
 
-    # 8) 硬掩码 L 修正(阴影区填 L_new,区外保持原 L;无羽化)
+    # 9) 硬掩码 L 修正(阴影区填 L_new,区外保持原 L;无羽化)
     L_final = np.where(shadow_mask, L_new, L)
 
-    # 9) ab 补偿: L 改后感知饱和度变化
-    #    混合后 boost 不再是常数,而是逐像素 per_pixel_boost = L_new[px] / L[px]
-    #    公式: 掩码内 C_new = C_old × per_pixel_boost[px]^α
-    #    掩码外: ab_scale = 1.0(不动 a, b)
-    #    ★ 必须先减 128 到 signed Lab 再缩放(直接对 uint8 缩放会暴增 chroma)
+    # 10) ab 补偿: L 改后感知饱和度变化
+    #     per_pixel_boost = L_new[px] / L[px],掩码内 C_new = C_old × boost^α
+    #     必须先减 128 到 signed Lab 再缩放(直接对 uint8 缩放会暴增 chroma)
     if ab_compensation_alpha > 0:
         per_pixel_boost = L_new / np.maximum(L, 1e-3)
         ab_scale = np.where(
@@ -324,7 +394,6 @@ def _remove_shadow_lab(bgr: np.ndarray,
         a_final = lab[..., 1]
         b_final = lab[..., 2]
 
-    # 重组 → BGR uint8
     lab_out = lab.copy()
     lab_out[..., 0] = L_final
     lab_out[..., 1] = a_final
@@ -339,39 +408,46 @@ class ShadowRemover:
     """阴影去除器(纯经典 Lab 空间方法,无神经网络,无羽化,无高光)。
 
     默认参数为动漫/插画场景下的推荐值;真实照片/3D 渲染可适当调小
-    `shadow_threshold`、调大 `sigma_ratio`、关闭 `use_morphology`。
+    ``shadow_threshold``、调大 ``sigma_ratio``、关闭 ``use_morphology``。
+
+    .. note::
+        所有可调参数的**规范配置源**位于
+        :py:data:`graphcolor.pipeline.DEFAULT_CONFIG["shadow_removal_params"]`。
+        此处的构造函数签名默认值仅作为独立使用时的回退值,
+        若通过 ``GraphColorPipeline`` 调用,参数以 ``pipeline`` 的配置为准。
+
+    .. note::
+        ``fast_mode`` 仅影响独立调用时的行为；若通过 ``GraphColorPipeline``
+        调用,忽略此参数(教师管线始终使用标准模式)。
     """
-    DEFAULT_CONFIG = {
+
+    def __init__(
+        self,
         # 总开关
-        "enabled": True,
+        enabled: bool = True,
 
         # ── 阴影检测与修正 ──
-        # 光照估计
-        "sigma_ratio": 0.10,             # 高斯 σ 与图片短边的比值
-        # 检测阈值
-        "shadow_threshold": 3.0,         # L_illum - L > 该值才视为阴影(3.0 激进,捕获浅阴影)
-        "dark_object_ratio": 0.20,       # L > ratio * L_illum 才视为潜在阴影(0.20 放宽,允许浅阴影)
-        # 形态学
-        "use_morphology": True,
-        "morph_kernel_size": 5,          # 小核(5x5 椭圆),避免 mask 过度外扩
-        # 目标 L 公式(0-1 归一化空间)
-        "target_l_offset": 0.1,         # 加性偏移;等价 0-100 空间的 "+5"
-        "target_l_gain": 1.25,            # 乘性增益
-        #   公式: target_L[block] = (offset + median_L[block]/255 × gain) × 255
-        #   每个色差约束连通块独立计算 median_L
-        # 色差约束连通块
-        "color_threshold": 15.0,         # BGR max 通道差阈值;相邻像素 diff < 该值才归入同一连通块
-        # 阴影区线性混合比例(避免纯色块,保留原始细节)
-        "shadow_blend": 0.5,             # 0=不改, 0.5=半细节保留(默认), 1=完全填 target_L
+        sigma_ratio: float = 0.10,                 # 高斯 σ 与图片短边的比值
+        shadow_threshold: float = 3.0,             # L_illum − L > 该值才视为阴影
+        dark_object_ratio: float = 0.20,           # L > ratio × L_illum 才视为潜在阴影
 
-        # ── ab 补偿 ──
-        "ab_compensation_alpha": 0.3,    # 0=关闭,0.3 轻度,0.5 中度,1.0 满补偿
-    }
+        use_morphology: bool = True,
+        morph_kernel_size: int = 5,
 
-    def __init__(self, **kwargs):
-        cfg = {**self.DEFAULT_CONFIG, **kwargs}
-        for key in cfg:
-            setattr(self, key, cfg[key])
+        target_l_offset: float = 0.08,             # 目标 L 加性偏移
+        target_l_gain: float = 1.2,                # 目标 L 乘性增益
+        shadow_blend: float = 0.5,                 # 线性混合比例
+        color_threshold: float = 15.0,             # 色差约束阈值
+
+        ab_compensation_alpha: float = 0.3,        # ab 补偿强度
+        ab_consistency_threshold: float = 20.0,    # 逐组件 ab 一致性阈值
+
+        # 快速模式
+        fast_mode: bool = False,                   # 跳过连通块+ab检查,全局目标L(更快但精度略降)
+    ):
+        for key, value in locals().items():
+            if key != 'self':
+                setattr(self, key, value)
 
     def _compute_sigma(self, bgr: np.ndarray) -> int:
         """根据短边和 sigma_ratio 计算高斯 σ。"""
@@ -400,7 +476,81 @@ class ShadowRemover:
             target_l_gain=self.target_l_gain,
             shadow_blend=self.shadow_blend,
             color_threshold=self.color_threshold,
+            ab_consistency_threshold=self.ab_consistency_threshold,
+            fast_mode=self.fast_mode,
         )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 批量预览: 对 img/ 下所有图片应用阴影去除,输出至 outputs/shadow_preview/
+# ──────────────────────────────────────────────────────────────────────
+def shadow_preview(img_dir: str = None,
+                   output_dir: str = None,
+                   remover: ShadowRemover = None,
+                   max_size: int = None) -> None:
+    """批量应用阴影去除并输出预览图。
+
+    Args:
+        img_dir: 输入图片目录（默认: 项目根目录下的 img/）
+        output_dir: 输出目录（默认: 项目根目录下的 outputs/shadow_preview/）
+        remover: 阴影去除器实例（默认: 使用 ShadowRemover()）
+        max_size: 处理前 resize 的最长边（默认: None=原尺寸;建议 512 加速大图）
+    """
+    import os, glob, time
+    from pathlib import Path
+
+    script_dir = Path(__file__).resolve().parent.parent  # graphcolor/..
+    img_dir = img_dir or os.path.join(script_dir, 'img')
+    output_dir = output_dir or os.path.join(script_dir, 'outputs', 'shadow_preview')
+
+    exts = ('*.jpg', '*.jpeg', '*.png', '*.bmp')
+    paths = []
+    for e in exts:
+        paths.extend(glob.glob(os.path.join(img_dir, e)))
+        paths.extend(glob.glob(os.path.join(img_dir, e.upper())))
+    paths = sorted(set(p.lower() for p in paths))
+
+    if not paths:
+        print(f"在 {img_dir} 中未找到图片")
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    sr = remover or ShadowRemover()
+    total_t, ok, skip = 0.0, 0, 0
+
+    print(f"阴影去除预览 — 处理 {len(paths)} 张图片")
+    print(f"  输入: {img_dir}")
+    print(f"  输出: {output_dir}")
+    if max_size:
+        print(f"  resize: 最长边 ≤ {max_size}px (加速大图处理)")
+    print()
+
+    for i, p in enumerate(paths):
+        name = os.path.basename(p)
+        img = cv2.imread(p)
+        if img is None:
+            print(f"  [{i+1}/{len(paths)}] 跳过: {name}")
+            skip += 1
+            continue
+
+        if max_size and max(img.shape[:2]) > max_size:
+            scale = max_size / max(img.shape[:2])
+            new_size = (int(img.shape[1] * scale), int(img.shape[0] * scale))
+            img = cv2.resize(img, new_size, interpolation=cv2.INTER_AREA)
+
+        t0 = time.perf_counter()
+        out = sr.remove(img)
+        ms = (time.perf_counter() - t0) * 1000
+        total_t += ms
+
+        out_path = os.path.join(output_dir, name)
+        cv2.imwrite(out_path, out)
+        print(f"  [{i+1}/{len(paths)}] {ms:6.1f}ms  {name}")
+        ok += 1
+
+    print(f"\n完成: {ok} 张成功, {skip} 张跳过")
+    print(f"总耗时: {total_t/1000:.1f}s  平均: {total_t/ok:.0f}ms/张")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -421,13 +571,17 @@ if __name__ == "__main__":
             _ = r.remove(img)
         ms = (time.perf_counter() - t0) / 20 * 1000
         print(f"512x512 单张耗时(无高光): {ms:.2f}ms")
+    elif len(sys.argv) >= 2 and sys.argv[1] == "preview":
+        # 批量预览
+        max_size = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 512
+        shadow_preview(max_size=max_size)
     else:
         # 正确性测试
         r = ShadowRemover()
 
-        # ── 辅助函数: 手动模拟 v3.6 算法, 计算期望 L_new ──
+        # 辅助函数: 手动模拟算法, 计算期望 L_new
         def _expected_l_new(img_bgr, remover, roi=None):
-            """手动模拟 v3.6 完整流水线, 返回期望 L_new (roi 区域均值) 或全图."""
+            """手动模拟完整流水线, 返回期望 L_new (roi 区域均值) 或全图."""
             lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2Lab).astype(np.float32)
             L = lab[..., 0]
             sigma = remover._compute_sigma(img_bgr)
@@ -466,9 +620,6 @@ if __name__ == "__main__":
             return L_new
 
         # T1: 阴影被提亮(色差约束连通块, 逐块 target_L)
-        #     阴影 128x128 BGR(80) 是均匀色块 → 一个连通块
-        #     median L ≈ 87, target_L = 12.75 + 1.2*87 ≈ 117.15
-        #     blend=0.5 → L_blend = 0.5*87 + 0.5*117.15 ≈ 102.1
         img = np.full((256, 256, 3), 200, dtype=np.uint8)
         img[64:192, 64:192] = (80, 80, 80)
         out = r.remove(img)
@@ -510,7 +661,6 @@ if __name__ == "__main__":
         assert 1.05 < ratio < 1.20, f"blend=0.5 提亮比例应≈1.10, 实际 {ratio:.3f}"
 
         # T5: ab 补偿 - 阴影区 a/b 缩放, hue 保持
-        #     64x64 阴影 BGR(50,65,80) 是均匀色块 → 一个连通块
         r_nocomp = ShadowRemover(ab_compensation_alpha=0.0)
         r_comp = ShadowRemover(ab_compensation_alpha=0.5)
         img_t5 = np.full((256, 256, 3), 200, dtype=np.uint8)
@@ -553,29 +703,23 @@ if __name__ == "__main__":
         assert abs(b_a0_s - b_nc_s) < 1.0, f"α=0 等同不补偿, b 差 {b_a0_s-b_nc_s:.2f}"
 
         # T7: 浅阴影和深阴影分属不同连通块, 各自独立提亮
-        #     构造: 深阴影 100x100 BGR(50) L≈53 + 浅阴影 4x4 BGR(100) L≈108
-        #     BGR max diff = 50 > color_threshold(15) → 分属不同连通块
-        #     深阴影: target_L = 12.75 + 1.2*53 ≈ 76.35, L_new ≈ 64.7
-        #     浅阴影: target_L = 12.75 + 1.2*108 ≈ 142.35, L_new ≈ 125.2
+        # 构造: 深阴影 100x100 BGR(50) + 浅阴影 4x4 BGR(100)
+        # BGR max diff = 50 > color_threshold(15) → 分属不同连通块
         img_t7 = np.full((256, 256, 3), 255, dtype=np.uint8)
         img_t7[78:178, 78:178] = (50, 50, 50)
         img_t7[170:174, 170:174] = (100, 100, 100)
         out_t7 = r.remove(img_t7)
-        # 1) 浅阴影 4x4 应被提亮
         L_bright_before = cv2.cvtColor(img_t7[170:174, 170:174], cv2.COLOR_BGR2Lab)[..., 0].mean()
         L_bright_after = cv2.cvtColor(out_t7[170:174, 170:174], cv2.COLOR_BGR2Lab)[..., 0].mean()
         print(f"[T7] 浅阴影 4x4 L: {L_bright_before:.1f} → {L_bright_after:.1f} "
               f"(色差约束连通块分离, 独立 target_L)")
         assert L_bright_after > L_bright_before + 5, \
             f"浅阴影应被提亮, 实际 {L_bright_before:.1f}→{L_bright_after:.1f}"
-        # 2) 深阴影区应被提亮
         L_shadow_before = cv2.cvtColor(img_t7[120:130, 120:130], cv2.COLOR_BGR2Lab)[..., 0].mean()
         L_shadow_after = cv2.cvtColor(out_t7[120:130, 120:130], cv2.COLOR_BGR2Lab)[..., 0].mean()
         print(f"[T7] 深阴影区 L: {L_shadow_before:.1f} → {L_shadow_after:.1f} (应被提亮)")
         assert L_shadow_after > L_shadow_before + 5, "深阴影应被提亮"
-        # 3) 验证浅阴影和深阴影分属不同连通块(通过 target_L 不同来间接验证)
-        #    若在同一块, target_L 相同, L_new 中浅阴影 L < 深阴影 L_new + small_gap
-        #    若在不同块, 浅阴影 target_L 更高, L_new 中浅阴影 L >> 深阴影 L_new
+        # 验证浅阴影和深阴影分属不同连通块(通过 target_L 不同来间接验证)
         bright_vs_dark_ratio = L_bright_after / L_shadow_after
         print(f"[T7] 浅阴影/深阴影 L_new 比值: {bright_vs_dark_ratio:.3f} "
               f"(>1.5 表明确实在不同连通块)")

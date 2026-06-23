@@ -38,15 +38,16 @@ def lab_to_bgr(L, a, b):
     return tuple(int(v) for v in bgr[0, 0])
 
 
-def draw_swatch(bgr_img, fg_lab, bg_lab, swatch_size=None):
-    """在图片左下角叠加两个方形色块(前景、背景),与 graphcolor 格式一致。
+def draw_swatch_on_original(original_bgr, fg_lab, bg_lab, swatch_size=None):
+    """在 **原图** 左下角叠加两个方形色块(前景、背景)。
 
-    色块采用"白外描边 + 黑内描边"的双层描边,确保无论原图深浅都能看清。
+    色块大小基于 **原图** 短边: size = min(orig_H, orig_W) * 0.06。
+    叠加前不再次去阴影、不再 resize,保证叠加结果与 graphcolor 格式一致。
     """
-    h, w = bgr_img.shape[:2]
-    canvas = bgr_img.copy()
+    h, w = original_bgr.shape[:2]
+    canvas = original_bgr.copy()
 
-    size = swatch_size or max(28, min(96, int(round(min(h, w) * 0.105))))
+    size = swatch_size or max(20, int(round(min(h, w) * 0.06)))
     gap = max(4, int(round(size * 0.16)))
     margin = max(8, int(round(size * 0.22)))
     stroke = max(2, int(round(size * 0.045)))
@@ -92,17 +93,34 @@ def main():
                         help='关闭阴影去除(默认开启,与 dataset.py 训练时一致)')
     parser.add_argument('--shadow-sigma-ratio', type=float, default=None,
                         help='覆盖 ShadowRemover 的 sigma_ratio(默认 0.125)')
+    parser.add_argument('--full-mode', action='store_true',
+                        help='使用完整阴影去除模式(默认快速,跳过连通块+ab检查,全局目标L);'
+                             '加此参数切换到标准模式 (色差约束连通块 + 逐块目标L + ab 一致性检查)')
+    parser.add_argument('--json', action='store_true',
+                        help='输出 JSON 而非预览图(用于程序化消费) -- 同时可指定 --json-name 自定义文件名')
+    parser.add_argument('--json-name', default='preview_predictions.json',
+                        help='--json 模式下的输出文件名(默认: preview_predictions.json,存于 outputs/)')
     args = parser.parse_args()
 
     project_root = os.path.normpath(os.path.join(SCRIPT_DIR, '..'))
     model_path = args.model or os.path.join(SCRIPT_DIR, 'best_model.pth')
-    output_dir = args.output_dir or os.path.join(project_root, 'outputs', 'model_previews')
     img_dir = args.img_dir or os.path.join(project_root, 'img')
+
+    # JSON 模式: 始终写入 ../outputs/<filename>.json(忽略 --output-dir)
+    # 预览图模式: 默认 ../outputs/model_previews, 可被 --output-dir 覆盖
+    if args.json:
+        outputs_root = os.path.join(project_root, 'outputs')
+        output_dir = outputs_root
+        json_path = os.path.join(outputs_root, args.json_name)
+    else:
+        output_dir = args.output_dir or os.path.join(project_root, 'outputs', 'model_previews')
+        json_path = None
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # 阴影去除器(必须与 student/dataset.py 训练时一致)
-    shadow_kwargs = {"enabled": not args.no_shadow_removal}
+    # 默认 fast_mode=True;--full-mode 切回标准模式
+    shadow_kwargs = {"enabled": not args.no_shadow_removal, "fast_mode": not args.full_mode}
     if args.shadow_sigma_ratio is not None:
         shadow_kwargs["sigma_ratio"] = args.shadow_sigma_ratio
     shadow_remover = ShadowRemover(**shadow_kwargs)
@@ -127,29 +145,54 @@ def main():
     print(f"设备: {device}")
     print(f"模型: {model_path}")
     print(f"阴影去除: {'关闭' if args.no_shadow_removal else '开启'}")
+    if not args.no_shadow_removal:
+        print(f"阴影去除模式: {'完整' if args.full_mode else '快速'}")
+    print(f"输出模式: {'JSON' if args.json else '预览图'}")
+    if args.json:
+        print(f"JSON 输出: {json_path}")
+    else:
+        print(f"预览图输出: {output_dir}")
     print(f"待处理: {len(all_paths)} 张图片")
-    print(f"输出目录: {output_dir}")
 
-    total_start = time.time()
+    total_start = time.perf_counter()
     success_count = 0
     skip_count = 0
-    elapsed_list = []
+    t_read_list = []
+    t_infer_list = []
+    t_write_list = []
+    json_records = []  # JSON 模式累积
+
+    # 每 N 张打印一次进度,减少控制台 I/O
+    PRINT_EVERY = 20
+
+    def _should_print(idx, total):
+        # 0-based idx:首张(i=0)、最后一张、每 PRINT_EVERY 张都打
+        return (idx + 1) % PRINT_EVERY == 0 or idx == total - 1
 
     with torch.no_grad():
         for i, path in enumerate(all_paths):
             name = os.path.basename(path)
-            img = cv2.imread(path)
-            if img is None:
+            t0 = time.perf_counter()
+            original_img = cv2.imread(path)
+            if original_img is None:
                 print(f"  [{i+1}/{len(all_paths)}] 跳过: {name} (无法读取)")
                 skip_count += 1
                 continue
+            t_io_read = time.perf_counter() - t0
 
-            t0 = time.time()
+            t1 = time.perf_counter()
 
-            # 阴影去除(必须与训练时一致,否则 student 看到不同分布)
-            img = shadow_remover.remove(img)
-
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            # 推理管线(必须与 train pipeline 完全一致):
+            #   原图 → resize_to_max(512) → 去阴影 → resize(128x128) → CNN
+            # 注意: 训练时 dataset.py 在去阴影后还会 resize 回原图尺寸给
+            #       RandomResizedCrop 采样,但 RandomResizedCrop 的输出已经是
+            #       128x128,与本步直接 resize(128) 等价。
+            infer_img = original_img
+            if max(infer_img.shape[:2]) > 512:
+                infer_img = cv2.resize(infer_img, (512, 512),
+                                       interpolation=cv2.INTER_AREA)
+            infer_img = shadow_remover.remove(infer_img)
+            img_rgb = cv2.cvtColor(infer_img, cv2.COLOR_BGR2RGB)
             img_pil = Image.fromarray(img_rgb)
             img_resized = img_pil.resize((128, 128), Image.LANCZOS)
             img_tensor = torch.tensor(np.array(img_resized).transpose(2, 0, 1), dtype=torch.float32) / 255.0
@@ -159,29 +202,80 @@ def main():
 
             fg_lab = pred_fg[0].cpu().numpy()
             bg_lab = pred_bg[0].cpu().numpy()
+            t_infer = time.perf_counter() - t1
 
-            out_img = draw_swatch(img, fg_lab, bg_lab)
-
-            out_path = os.path.join(output_dir, name)
-            cv2.imwrite(out_path, out_img)
-
-            elapsed = time.time() - t0
-            elapsed_list.append(elapsed)
-            print(f"  [{i+1}/{len(all_paths)}] OK  {name}  {elapsed*1000:.0f}ms  "
-                  f"FG=({fg_lab[0]:.0f},{fg_lab[1]:.0f},{fg_lab[2]:.0f})  "
-                  f"BG=({bg_lab[0]:.0f},{bg_lab[1]:.0f},{bg_lab[2]:.0f})")
+            t_io_write = 0.0
+            if args.json:
+                # JSON 模式: 累积记录,循环结束后一次性写入
+                json_records.append({
+                    "image": name,
+                    "path": os.path.normpath(path),
+                    "image_size": [int(original_img.shape[1]), int(original_img.shape[0])],
+                    "fg_lab": [round(float(fg_lab[0]), 2),
+                               round(float(fg_lab[1]), 2),
+                               round(float(fg_lab[2]), 2)],
+                    "bg_lab": [round(float(bg_lab[0]), 2),
+                               round(float(bg_lab[1]), 2),
+                               round(float(bg_lab[2]), 2)],
+                    "elapsed_ms": round((t_io_read + t_infer) * 1000, 2),
+                    "read_ms": round(t_io_read * 1000, 2),
+                    "infer_ms": round(t_infer * 1000, 2),
+                })
+                if _should_print(i, len(all_paths)):
+                    print(f"  [{i+1}/{len(all_paths)}] OK  {name}")
+            else:
+                t2 = time.perf_counter()
+                # 预览图模式: 在 **原图** 上叠加色块(色块大小按原图短边 0.06)
+                out_img = draw_swatch_on_original(original_img, fg_lab, bg_lab)
+                out_path = os.path.join(output_dir, name)
+                cv2.imwrite(out_path, out_img)
+                t_io_write = time.perf_counter() - t2
+                if _should_print(i, len(all_paths)):
+                    print(f"  [{i+1}/{len(all_paths)}] OK  {name}")
             success_count += 1
 
-    total_elapsed = time.time() - total_start
-    avg_per_image = total_elapsed / success_count if success_count > 0 else 0
-    median_per_image = float(np.median(elapsed_list)) if elapsed_list else 0.0
+            # 各分项耗时累加,最后做平均
+            t_read_list.append(t_io_read)
+            t_infer_list.append(t_infer)
+            t_write_list.append(t_io_write)
+
+    # JSON 模式: 一次性写入文件
+    if args.json and json_records:
+        import json as _json
+        payload = {
+            "model": os.path.normpath(model_path),
+            "shadow_removal": not args.no_shadow_removal,
+            "image_count": len(json_records),
+            "skipped_count": skip_count,
+            "predictions": json_records,
+        }
+        with open(json_path, 'w', encoding='utf-8') as f:
+            _json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    total_elapsed = time.perf_counter() - total_start
+
+    # 分项统计:读盘 / 推理 / 写盘
+    def _stat(lst):
+        if not lst:
+            return 0.0, 0.0
+        return (float(np.mean(lst)) * 1000, float(np.median(lst)) * 1000)
+
+    avg_read, med_read = _stat(t_read_list)
+    avg_infer, med_infer = _stat(t_infer_list)
+    avg_write, med_write = _stat(t_write_list)
 
     print(f"\n完成！")
     print(f"  成功: {success_count} 张  跳过: {skip_count} 张")
     print(f"  总耗时: {total_elapsed:.2f}s")
-    print(f"  平均每张: {avg_per_image*1000:.0f}ms")
-    print(f"  中位数每张: {median_per_image*1000:.0f}ms")
-    print(f"  预览图已保存至: {output_dir}")
+    print(f"  读盘   平均/中位: {avg_read:.0f}ms / {med_read:.0f}ms")
+    print(f"  推理   平均/中位: {avg_infer:.0f}ms / {med_infer:.0f}ms")
+    print(f"  写盘   平均/中位: {avg_write:.0f}ms / {med_write:.0f}ms")
+    print(f"  端到端 平均/中位: {(avg_read+avg_infer+avg_write):.0f}ms / "
+          f"{(med_read+med_infer+med_write):.0f}ms")
+    if args.json:
+        print(f"  JSON 已保存至: {json_path}")
+    else:
+        print(f"  预览图已保存至: {output_dir}")
 
 if __name__ == '__main__':
     main()

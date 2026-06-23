@@ -11,7 +11,7 @@ dE*ab 越小表示预测 Lab 与教师标签 Lab 在感知空间上越接近,
     dE*ab < 3   高质量
     dE*ab < 5   可接受
 """
-import sys, os, glob
+import sys, os, glob, argparse
 import torch
 from torch.utils.data import DataLoader
 
@@ -57,20 +57,28 @@ def main():
     parser = argparse.ArgumentParser(description="在 val 集上评估 ColorNet-Masked 学生模型")
     parser.add_argument('--no-shadow-removal', action='store_true',
                         help='关闭阴影去除(必须与训练/推理一致,否则指标无意义)')
+    parser.add_argument('--cache-dir', type=str, default=None,
+                        help='阴影去除缓存目录(默认: student/.shadow_cache/)')
+    parser.add_argument('--no-cache', action='store_true',
+                        help='禁用阴影去除缓存')
     args = parser.parse_args()
     use_shadow_removal = not args.no_shadow_removal
+    cache_dir = None if args.no_cache else args.cache_dir
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = ColorNetMasked().to(device)
     model.load_state_dict(torch.load('best_model.pth', map_location=device))
     model.eval()
     print(f"阴影去除: {'关闭' if not use_shadow_removal else '开启'}")
+    if use_shadow_removal:
+        print(f"阴影缓存: {'禁用' if cache_dir is None else cache_dir}")
 
     target_jsons = find_all_targets()
     img_dir = DEFAULT_IMG_DIR
     val_set = ColorDataset(img_dir, target_jsons, 'val',
                            pixiv_download_dir=DEFAULT_PIXIV_DIR,
-                           use_shadow_removal=use_shadow_removal)
+                           use_shadow_removal=use_shadow_removal,
+                           cache_dir=cache_dir)
     loader = DataLoader(val_set, batch_size=64, shuffle=False)
 
     if len(val_set) == 0:
